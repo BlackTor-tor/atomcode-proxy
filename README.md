@@ -57,10 +57,17 @@ python run.py
 
 ## 客户端接入
 
-### Codex CLI
+通用要点：
 
-```bash
-# config.toml
+- **Base URL（OpenAI 兼容）**：`http://127.0.0.1:8765/v1`
+- **Base URL（Anthropic 兼容）**：`http://127.0.0.1:8765`
+- **API Key**：任意非空值即可（代理不校验）
+- **可用模型**：`AtomGit-deepseek-v4-flash`（默认）、`AtomGit-Qwen-Qwen3-VL-8B-Instruct`
+
+### Codex CLI（OpenAI 兼容）
+
+```toml
+# ~/.codex/config.toml
 model_provider = "atomcode"
 model = "AtomGit-deepseek-v4-flash"
 
@@ -70,17 +77,67 @@ base_url = "http://127.0.0.1:8765/v1"
 env_key = "ATOMCODE_API_KEY"   # 任意非空值即可，代理不校验
 ```
 
-### Cursor（OpenAI 兼容）
+```powershell
+$env:ATOMCODE_API_KEY = "dummy"
+codex exec "你好"
+```
 
-Settings -> Models -> 添加 "OpenAI Compatible" provider：
-- Base URL: `http://127.0.0.1:8765/v1`
-- API Key: 任意值
+### Cursor（OpenAI 或 Anthropic 兼容）
+
+Settings -> Models -> 添加 provider：
+
+- **方式一**（OpenAI 兼容）：Type 选 "OpenAI"，Base URL 填 `http://127.0.0.1:8765/v1`，API Key 任意值
+- **方式二**（Anthropic 兼容）：Type 选 "Anthropic"，Base URL 填 `http://127.0.0.1:8765`，API Key 任意值
+
+添加模型后勾选 `AtomGit-deepseek-v4-flash` 即可使用。
 
 ### Claude Code（Anthropic 兼容）
 
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8765"
+$env:ANTHROPIC_AUTH_TOKEN = "dummy"
+claude
+```
+
+### Cline / Roo Code（VS Code 插件，OpenAI 兼容）
+
+API Provider 选 **OpenAI Compatible**：
+
+- Base URL: `http://127.0.0.1:8765/v1`
+- API Key: 任意值
+- Model ID: `AtomGit-deepseek-v4-flash`
+
+### Cherry Studio / Chatbox（桌面客户端，OpenAI 兼容）
+
+添加自定义 Provider：
+
+- API 地址: `http://127.0.0.1:8765/v1`
+- API Key: 任意值
+- 模型名: `AtomGit-deepseek-v4-flash`
+
+### OpenAI SDK（编程调用）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8765/v1",
+    api_key="dummy",
+)
+resp = client.chat.completions.create(
+    model="AtomGit-deepseek-v4-flash",
+    messages=[{"role": "user", "content": "你好"}],
+)
+print(resp.choices[0].message.content)
+```
+
+### curl 快速验证
+
 ```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8765"
-export ANTHROPIC_AUTH_TOKEN="dummy"
+curl http://127.0.0.1:8765/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{"model":"AtomGit-deepseek-v4-flash","messages":[{"role":"user","content":"说你好"}]}'
 ```
 
 ## 协议映射说明
@@ -104,3 +161,5 @@ export ANTHROPIC_AUTH_TOKEN="dummy"
 - daemon 无 OpenAI/Anthropic 原生端点，必须经本代理转发。
 - 云端直连需要 HKDF 请求签名，本代理只走本地 daemon，不直连云端。
 - 多客户端共用同一 working_dir 时共享同一 daemon session（上下文会串），可用 `ATOMCODE_PROXY_WORKDIR` 或各自环境变量隔离。
+- 工具调用由 daemon 在 `bypass` 模式下自行执行（如文件读写、命令执行），**不映射为 OpenAI/Anthropic 的 tool_calls 协议**；因此依赖标准 tool_calls 的客户端（如强制 function calling 的编排框架）可能无法获得工具结果透传，但对话与代码生成不受影响。
+- 模型的 `reasoning_content`（思维链）仅在 OpenAI 兼容端点返回；Anthropic 端点忽略 reasoning，只输出正文，避免客户端因缺 signature 报错。
