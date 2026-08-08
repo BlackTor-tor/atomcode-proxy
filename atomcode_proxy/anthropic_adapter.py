@@ -59,7 +59,6 @@ async def _messages_to_anthropic_events(
     daemon: AtomCodeDaemon,
     message: str,
     *,
-    session_id: str,
     working_dir: str,
     provider: str,
     model_reported: str,
@@ -82,8 +81,8 @@ async def _messages_to_anthropic_events(
     )
 
     output_tokens = 0
-    async for ev in daemon.chat_stream(
-        message, session_id=session_id, working_dir=working_dir, provider=provider
+    async for ev in daemon.chat_with_session(
+        message, working_dir=working_dir, provider=provider
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -120,7 +119,6 @@ async def _messages_to_anthropic_object(
     daemon: AtomCodeDaemon,
     message: str,
     *,
-    session_id: str,
     working_dir: str,
     provider: str,
     model_reported: str,
@@ -128,8 +126,8 @@ async def _messages_to_anthropic_object(
     text_parts: list[str] = []
     stop_reason = "stopped"
     input_tokens = output_tokens = 0
-    async for ev in daemon.chat_stream(
-        message, session_id=session_id, working_dir=working_dir, provider=provider
+    async for ev in daemon.chat_with_session(
+        message, working_dir=working_dir, provider=provider
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -167,18 +165,11 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
 
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
-    try:
-        session_id = await daemon.ensure_session(cfg.working_dir)
-    except AtomCodeDaemonError as e:
-        return JSONResponse(
-            status_code=502,
-            content={"type": "error", "error": {"type": "api_error", "message": str(e)}},
-        )
 
     model_reported = model_raw or provider
     if stream:
         gen = _messages_to_anthropic_events(
-            daemon, message, session_id=session_id, working_dir=cfg.working_dir,
+            daemon, message, working_dir=cfg.working_dir,
             provider=provider, model_reported=model_reported, msg_id=_gen_msg_id(),
         )
         return StreamingResponse(
@@ -188,7 +179,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
         )
     try:
         obj = await _messages_to_anthropic_object(
-            daemon, message, session_id=session_id, working_dir=cfg.working_dir,
+            daemon, message, working_dir=cfg.working_dir,
             provider=provider, model_reported=model_reported,
         )
         return JSONResponse(obj)

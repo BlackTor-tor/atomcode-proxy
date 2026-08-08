@@ -59,7 +59,6 @@ async def _chat_to_openai_events(
     daemon: AtomCodeDaemon,
     message: str,
     *,
-    session_id: str,
     working_dir: str,
     provider: str,
     model_reported: str,
@@ -70,8 +69,8 @@ async def _chat_to_openai_events(
     # 首块：声明 assistant 角色
     yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
-    async for ev in daemon.chat_stream(
-        message, session_id=session_id, working_dir=working_dir, provider=provider
+    async for ev in daemon.chat_with_session(
+        message, working_dir=working_dir, provider=provider
     ):
         etype = ev.get("type")
         if etype == "reasoning":
@@ -93,7 +92,6 @@ async def _chat_to_openai_object(
     daemon: AtomCodeDaemon,
     message: str,
     *,
-    session_id: str,
     working_dir: str,
     provider: str,
     model_reported: str,
@@ -103,8 +101,8 @@ async def _chat_to_openai_object(
     reasoning_parts: list[str] = []
     stop_reason = "stopped"
     prompt_tokens = completion_tokens = 0
-    async for ev in daemon.chat_stream(
-        message, session_id=session_id, working_dir=working_dir, provider=provider
+    async for ev in daemon.chat_with_session(
+        message, working_dir=working_dir, provider=provider
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -159,15 +157,11 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
 
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
-    try:
-        session_id = await daemon.ensure_session(cfg.working_dir)
-    except AtomCodeDaemonError as e:
-        return JSONResponse(status_code=502, content={"error": {"message": str(e), "type": "upstream_error"}})
 
     model_reported = model_raw or provider
     if stream:
         gen = _chat_to_openai_events(
-            daemon, message, session_id=session_id, working_dir=cfg.working_dir,
+            daemon, message, working_dir=cfg.working_dir,
             provider=provider, model_reported=model_reported,
             chat_id=_gen_id(), created=_now(),
         )
@@ -178,7 +172,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         )
     try:
         obj = await _chat_to_openai_object(
-            daemon, message, session_id=session_id, working_dir=cfg.working_dir, provider=provider,
+            daemon, message, working_dir=cfg.working_dir, provider=provider,
             model_reported=model_reported,
         )
         return JSONResponse(obj)
