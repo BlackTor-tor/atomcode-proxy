@@ -90,7 +90,7 @@ class AtomCodeDaemon:
         default_provider: str = "AtomGit-deepseek-v4-flash",
         approval_mode: str = "bypass",
         default_working_dir: str = ".",
-        timeout: float = 300.0,
+        timeout: float | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.default_provider = default_provider
@@ -100,6 +100,8 @@ class AtomCodeDaemon:
             "Authorization": f"Bearer {daemon_token}",
             "X-AtomCode-Client": "webui",
         }
+        # read/write/pool 不设上限：长任务（模型长时间思考、agent 执行工具）
+        # 可能数分钟无事件输出，固定 300s 超时会中断会话。connect 保留 10s。
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=self._headers,
