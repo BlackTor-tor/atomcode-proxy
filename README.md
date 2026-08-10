@@ -160,6 +160,6 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 
 - daemon 无 OpenAI/Anthropic 原生端点，必须经本代理转发。
 - 云端直连需要 HKDF 请求签名，本代理只走本地 daemon，不直连云端。
-- 多客户端共用同一 working_dir 时共享同一 daemon session（上下文会串），可用 `ATOMCODE_PROXY_WORKDIR` 或各自环境变量隔离。
+- 多客户端共用同一 working_dir 时，session 池已按客户端身份（auth + user-agent）隔离，各客户端上下文互不串扰。
 - 工具调用由 daemon 在 `bypass` 模式下自行执行（如文件读写、命令执行），**不映射为 OpenAI/Anthropic 的 tool_calls 协议**；因此依赖标准 tool_calls 的客户端（如强制 function calling 的编排框架）可能无法获得工具结果透传，但对话与代码生成不受影响。
 - 模型的 `reasoning_content`（思维链）仅在 OpenAI 兼容端点返回；Anthropic 端点忽略 reasoning，只输出正文，避免客户端因缺 signature 报错。

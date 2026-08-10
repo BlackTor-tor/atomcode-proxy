@@ -22,8 +22,13 @@ BASE_HEADERS_DEFAULT = {
     "X-AtomCode-Client": "webui",
 }
 
-# 每个 working_dir 的 session 池上限，超出淘汰最旧的
+# 每个 (working_dir, client_key) 的 session 池上限，超出淘汰最旧的
 MAX_POOL_SIZE = 8
+
+# 409 session_busy 时优先等待原 session 释放（保住上下文），
+# 每隔 BUSY_RETRY_INTERVAL 秒重试同一 session，超过 BUSY_WAIT_TIMEOUT 才丢弃换新。
+BUSY_RETRY_INTERVAL = 5.0
+BUSY_WAIT_TIMEOUT = 60.0
 
 
 class AtomCodeDaemonError(RuntimeError):
@@ -50,13 +55,18 @@ class SessionPool:
     def __init__(self, daemon: "AtomCodeDaemon") -> None:
         self._daemon = daemon
         self._lock = asyncio.Lock()
-        self._pools: dict[str, list[str]] = {}  # working_dir -> [session_id...]
-        self._busy: set[str] = set()            # 正在被使用的 session_id
+        self._pools: dict[tuple[str, str], list[str]] = {}  # (working_dir, client_key) -> [session_id...]
+        self._busy: set[str] = set()                        # 正在被使用的 session_id
 
-    async def acquire(self, working_dir: str) -> str:
-        """返回一个空闲 session；全忙或池空则新建。"""
+    async def acquire(self, working_dir: str, client_key: str | None = None) -> str:
+        """返回一个空闲 session；全忙或池空则新建。
+
+        session 池按 (working_dir, client_key) 隔离：不同客户端（Cursor/Codex/
+        Claude Code）即使共用同一 working_dir 也各自拥有独立上下文，互不串扰。
+        """
+        key = (working_dir, client_key or "")
         async with self._lock:
-            pool = self._pools.setdefault(working_dir, [])
+            pool = self._pools.setdefault(key, [])
             for sid in pool:
                 if sid not in self._busy:
                     self._busy.add(sid)
@@ -72,10 +82,11 @@ class SessionPool:
     def release(self, session_id: str) -> None:
         self._busy.discard(session_id)
 
-    async def discard(self, working_dir: str, session_id: str) -> None:
+    async def discard(self, working_dir: str, session_id: str, client_key: str | None = None) -> None:
         """把坏 session（busy 卡死等）移出池，下次请求不再复用。"""
+        key = (working_dir, client_key or "")
         async with self._lock:
-            pool = self._pools.get(working_dir, [])
+            pool = self._pools.get(key, [])
             if session_id in pool:
                 pool.remove(session_id)
             self._busy.discard(session_id)
@@ -137,38 +148,51 @@ class AtomCodeDaemon:
         message: str,
         *,
         working_dir: str | None = None,
+        client_key: str | None = None,
         provider: str | None = None,
         approval_mode: str | None = None,
-        max_retries: int = 3,
     ) -> AsyncIterator[dict[str, Any]]:
         """从池中取一个空闲 session 发消息，yield daemon 的 SSE 事件。
 
-        并发请求自动分到不同 session；遇到 409 session_busy 时丢弃该
-        session 并换新的重试（daemon 侧单 session 只允许一个 chat 操作）。
+        并发请求自动分到不同 session；遇到 409 session_busy 时**优先等待原
+        session 释放后重试同一 session**（保住上下文），按 BUSY_RETRY_INTERVAL
+        轮询直到 BUSY_WAIT_TIMEOUT；仍 busy 才丢弃并换新 session 兜底，
+        避免"换新 session 丢记忆"导致任务接不上。
         """
         wd = working_dir or self.default_working_dir
-        last_err: AtomCodeDaemonError | None = None
-        for attempt in range(max_retries):
-            session_id = await self._pool.acquire(wd)
-            try:
-                async for ev in self._chat_stream_raw(
-                    message,
-                    session_id=session_id,
-                    working_dir=wd,
-                    provider=provider,
-                    approval_mode=approval_mode,
-                ):
-                    yield ev
-                return
-            except SessionBusyError as e:
-                log.warning("session busy (%s), switching session, attempt=%d", session_id, attempt + 1)
-                await self._pool.discard(wd, session_id)
-                last_err = e
-                continue
-            finally:
-                self._pool.release(session_id)
-        if last_err is not None:
-            raise last_err
+        session_id = await self._pool.acquire(wd, client_key)
+        # 409 等待窗口截止时间：首次 acquire 后重置，超时后丢弃换新
+        deadline = asyncio.get_running_loop().time() + BUSY_WAIT_TIMEOUT
+        try:
+            while True:
+                try:
+                    async for ev in self._chat_stream_raw(
+                        message,
+                        session_id=session_id,
+                        working_dir=wd,
+                        provider=provider,
+                        approval_mode=approval_mode,
+                    ):
+                        yield ev
+                    return
+                except SessionBusyError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        # 等待超时：丢弃坏 session 换新的兜底（新 session 重置等待窗口）
+                        log.warning(
+                            "session %s busy > %.0fs, discarding and retrying with fresh session",
+                            session_id, BUSY_WAIT_TIMEOUT,
+                        )
+                        await self._pool.discard(wd, session_id, client_key)
+                        session_id = await self._pool.acquire(wd, client_key)
+                        deadline = asyncio.get_running_loop().time() + BUSY_WAIT_TIMEOUT
+                        continue
+                    log.warning(
+                        "session busy (%s), waiting %.0fs before retry (keep context)",
+                        session_id, BUSY_RETRY_INTERVAL,
+                    )
+                    await asyncio.sleep(BUSY_RETRY_INTERVAL)
+        finally:
+            self._pool.release(session_id)
 
     async def _chat_stream_raw(
         self,

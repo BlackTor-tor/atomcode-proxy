@@ -15,12 +15,24 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .daemon import AtomCodeDaemon, AtomCodeDaemonError
+from .sse import HEARTBEAT, with_heartbeat
 
 log = logging.getLogger("atomcode_proxy.anthropic")
 
 router = APIRouter()
 
 _TEXT_CHUNK_SIZE = 8
+
+
+def _client_key(request: Request) -> str:
+    """按客户端身份隔离 daemon session 池：auth + user-agent。
+
+    不同客户端（Cursor / Codex / Claude Code）即使共用同一 working_dir
+    也各自持有独立上下文，避免多客户端同时跑任务时串记忆。
+    """
+    auth = request.headers.get("authorization", "")
+    ua = request.headers.get("user-agent", "")
+    return f"{auth}|{ua}"
 
 
 def _gen_msg_id() -> str:
@@ -63,6 +75,7 @@ async def _messages_to_anthropic_events(
     provider: str,
     model_reported: str,
     msg_id: str,
+    client_key: str,
 ) -> AsyncIterator[str]:
     message_obj = {
         "id": msg_id,
@@ -81,9 +94,14 @@ async def _messages_to_anthropic_events(
     )
 
     output_tokens = 0
-    async for ev in daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider
-    ):
+    events = daemon.chat_with_session(
+        message, working_dir=working_dir, provider=provider, client_key=client_key
+    )
+    async for ev in with_heartbeat(events):
+        if ev is HEARTBEAT:
+            # 模型长时间无事件输出时的心跳：Anthropic 官方 ping 事件，客户端视为连接存活
+            yield _sse("ping", {"type": "ping"})
+            continue
         etype = ev.get("type")
         if etype == "text":
             content = ev.get("content", "")
@@ -122,12 +140,13 @@ async def _messages_to_anthropic_object(
     working_dir: str,
     provider: str,
     model_reported: str,
+    client_key: str,
 ) -> dict[str, Any]:
     text_parts: list[str] = []
     stop_reason = "stopped"
     input_tokens = output_tokens = 0
     async for ev in daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider
+        message, working_dir=working_dir, provider=provider, client_key=client_key
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -165,12 +184,14 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
 
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
+    client_key = _client_key(request)
 
     model_reported = model_raw or provider
     if stream:
         gen = _messages_to_anthropic_events(
             daemon, message, working_dir=cfg.working_dir,
             provider=provider, model_reported=model_reported, msg_id=_gen_msg_id(),
+            client_key=client_key,
         )
         return StreamingResponse(
             gen,
@@ -180,7 +201,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     try:
         obj = await _messages_to_anthropic_object(
             daemon, message, working_dir=cfg.working_dir,
-            provider=provider, model_reported=model_reported,
+            provider=provider, model_reported=model_reported, client_key=client_key,
         )
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:
