@@ -4,20 +4,36 @@
 """
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger("atomcode_proxy.config")
 
 # 项目根目录 = 本文件所在目录的上一级
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _load_dotenv(path: Path = _PROJECT_ROOT / ".env") -> None:
+def _default_env_path() -> Path:
+    """默认 .env 路径：冻结态(PyInstaller)取 exe 旁；否则取项目根目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / ".env"
+    return _PROJECT_ROOT / ".env"
+
+
+def _load_dotenv(path: Path | None = None) -> None:
     """轻量 .env 加载：不覆盖已存在的环境变量。
 
     仅支持 KEY=VALUE 行、# 注释、双引号包裹的值；不处理变量展开。
+    路径优先级：环境变量 ATOMCODE_PROXY_ENV > _default_env_path()。
     """
+    override = os.environ.get("ATOMCODE_PROXY_ENV")
+    if path is None:
+        path = Path(override) if override else _default_env_path()
     if not path.is_file():
+        log.info("未找到 .env，使用默认配置")
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -28,6 +44,7 @@ def _load_dotenv(path: Path = _PROJECT_ROOT / ".env") -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+    log.info(".env 加载完成: %s", path)
 
 
 _load_dotenv()

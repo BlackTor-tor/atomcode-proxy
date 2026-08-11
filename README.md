@@ -15,6 +15,32 @@ flowchart LR
 
 数据流：上游客户端 -> 本代理（协议翻译）-> AtomCode 本地 daemon（`/sessions` + `/chat`）-> 云端。
 
+## 便携版下载（Windows）
+
+无需 Python 环境，直接下载单文件 exe 运行。发布页：
+
+👉 <https://github.com/BlackTor-tor/atomcode-proxy/releases>
+
+使用步骤：
+
+1. 从最新 Release 下载 `atomcode-proxy-<版本>-windows-x64.exe` 与 `.env.example`，放到**同一目录**。
+2. 将 `.env.example` 复制为 `.env`，按需编辑配置。
+3. 双击 exe 即可运行：弹出的**控制台窗口即日志**，关闭窗口即停止服务。默认监听 `127.0.0.1:8765`。
+
+主要配置项（完整列表见 `.env.example`）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `ATOMCODE_PROXY_HOST` / `ATOMCODE_PROXY_PORT` | `127.0.0.1` / `8765` | 代理监听地址与端口 |
+| `ATOMCODE_DAEMON_URL` | `http://127.0.0.1:13456` | AtomCode daemon 地址 |
+| `ATOMCODE_DAEMON_TOKEN` | `atomcode_webui` | daemon 认证 token |
+| `ATOMCODE_DEFAULT_PROVIDER` | `AtomGit-deepseek-v4-flash` | 默认模型 provider |
+| `ATOMCODE_APPROVAL_MODE` | `bypass` | 审批模式 |
+| `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 工作目录 |
+| `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名 |
+
+> ⚠️ Windows Defender / 杀毒软件可能对 PyInstaller 打包的单文件程序误报（未经数字签名的可执行文件常见现象）。如遇拦截，请添加信任或允许运行，也可按下文自行从源码构建。
+
 ## 前置条件
 
 1. AtomCode daemon 已启动并监听 `127.0.0.1:13456`：
@@ -36,6 +62,23 @@ pip install -r requirements.txt
 python run.py
 # 默认监听 127.0.0.1:8765
 ```
+
+## 从源码构建
+
+开发模式直接运行：
+
+```powershell
+python run.py
+```
+
+构建便携版单文件 exe（PyInstaller onefile）：
+
+```powershell
+.\scripts\build.ps1 -Version 0.1.0
+# 产物在 release\ 目录
+```
+
+自动发布：推送 `v*` 格式的 tag（如 `git tag v0.1.0; git push origin v0.1.0`）会触发 GitHub Actions（`.github/workflows/release.yml`）在 Windows 上自动构建 exe 并发布 Release，版本号取自 tag 名。
 
 ## 配置
 

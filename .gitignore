@@ -6,3 +6,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 打包产物
+build/
+dist/
+release/

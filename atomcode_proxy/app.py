@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .config import Config
 from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
@@ -32,7 +34,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         yield
         await daemon.close()
 
-    app = FastAPI(title="atomcode-proxy", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="atomcode-proxy", version=__version__, lifespan=lifespan)
     app.include_router(openai_adapter.router)
     app.include_router(anthropic_adapter.router)
     app.state.config = cfg
@@ -43,6 +45,6 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.get("/version")
     async def version() -> dict:
-        return {"name": "atomcode-proxy", "version": "0.1.0"}
+        return {"name": "atomcode-proxy", "version": __version__, "frozen": getattr(sys, "frozen", False)}
 
     return app
