@@ -83,6 +83,7 @@ class SystemTray:
 
             menu_items = [
                 Item("打开状态页面", self._open_status_page),
+                Item("打开设置页面", self._open_settings_page),
                 Item("显示日志", self._open_log_file),
                 pystray.Menu.SEPARATOR,
                 Item("退出", self._quit),
@@ -106,6 +107,12 @@ class SystemTray:
         """打开浏览器访问状态页面。"""
         url = f"http://{self.host}:{self.port}/"
         log.info("打开状态页面: %s", url)
+        webbrowser.open(url)
+
+    def _open_settings_page(self, icon=None, item=None) -> None:
+        """打开浏览器访问设置页面。"""
+        url = f"http://{self.host}:{self.port}/settings"
+        log.info("打开设置页面: %s", url)
         webbrowser.open(url)
 
     def _open_log_file(self, icon=None, item=None) -> None:
