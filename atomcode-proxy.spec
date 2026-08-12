@@ -21,12 +21,17 @@ VERSION = _match.group(1) if _match else "0.0.0"
 hiddenimports = collect_submodules("uvicorn")
 
 # 可选依赖：环境未装则跳过（容错）
-for _mod in ("websockets", "httptools", "watchfiles"):
+for _mod in ("websockets", "httptools", "watchfiles", "pystray", "PIL"):
     try:
         __import__(_mod)
         hiddenimports.append(_mod)
     except ImportError:
         pass
+
+# pystray 和 Pillow 的依赖收集
+for _mod in collect_submodules("pystray") + collect_submodules("PIL"):
+    if _mod not in hiddenimports:
+        hiddenimports.append(_mod)
 
 a = Analysis(
     ["run.py"],
@@ -37,7 +42,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["uvloop"],
+    excludes=["uvloop", "PySide6"],
     noarchive=False,
 )
 
@@ -54,6 +59,6 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
     onefile=True,
 )

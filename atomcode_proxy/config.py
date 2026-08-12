@@ -15,17 +15,18 @@ log = logging.getLogger("atomcode_proxy.config")
 # 项目根目录 = 本文件所在目录的上一级
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# 内置 .env 模板：首次运行且 .env 不存在时自动写入
+# 内置 .env 模板：供 --init-config 手动生成时使用
 DEFAULT_ENV_TEMPLATE = """\
-# 复制为 .env 后按需修改
-ATOMCODE_PROXY_HOST=127.0.0.1
-ATOMCODE_PROXY_PORT=8765
-ATOMCODE_DAEMON_URL=http://127.0.0.1:13456
-ATOMCODE_DAEMON_TOKEN=atomcode_webui
-ATOMCODE_DEFAULT_PROVIDER=AtomGit-deepseek-v4-flash
-ATOMCODE_APPROVAL_MODE=bypass
-ATOMCODE_PROXY_WORKDIR=
-ATOMCODE_MODEL_ALIAS=
+# atomcode-proxy 配置文件（可选，所有项均有内置默认值）
+# 仅在需要自定义时取消注释
+#ATOMCODE_PROXY_HOST=127.0.0.1
+#ATOMCODE_PROXY_PORT=8765
+#ATOMCODE_DAEMON_URL=http://127.0.0.1:13456
+#ATOMCODE_DAEMON_TOKEN=atomcode_webui
+#ATOMCODE_DEFAULT_PROVIDER=AtomGit-deepseek-v4-flash
+#ATOMCODE_APPROVAL_MODE=bypass
+#ATOMCODE_PROXY_WORKDIR=
+#ATOMCODE_MODEL_ALIAS=
 """
 
 
@@ -105,3 +106,10 @@ class Config:
             return self.model_alias[model]
         # 直接透传（daemon 侧认识自己的 provider 名）
         return model
+
+    @property
+    def daemon_port(self) -> int:
+        """从 daemon_url 解析端口号。"""
+        from urllib.parse import urlparse
+        parsed = urlparse(self.daemon_url)
+        return parsed.port or 13456

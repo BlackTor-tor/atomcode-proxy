@@ -17,15 +17,24 @@ flowchart LR
 
 ## 便携版下载（Windows）
 
-无需 Python 环境，直接下载单文件 exe 运行。发布页：
+无需 Python 环境，**双击即用**。发布页：
 
 👉 <https://github.com/BlackTor-tor/atomcode-proxy/releases>
 
 使用步骤：
 
 1. 从最新 Release 下载 `atomcode-proxy-<版本>-windows-x64.exe`。
-2. 双击 exe 运行：首次启动会自动在当前目录生成 `.env` 配置文件，按需编辑后再次启动即可。
-3. 弹出的**控制台窗口即日志**，关闭窗口即停止服务。默认监听 `127.0.0.1:8765`。
+2. **双击运行**即可——程序会自动启动 AtomCode daemon（如果未运行）并启动代理服务。
+3. 无需任何配置，开箱即用。默认监听 `127.0.0.1:8765`。
+4. 程序自动打开浏览器显示状态页面，系统托盘图标提供以下功能：
+   - **打开状态页面**：查看服务状态、daemon 连接信息、客户端接入指南
+   - **显示日志**：用记事本打开运行日志文件
+   - **退出**：停止所有服务并关闭程序
+5. 点击托盘“退出”即完全关闭（exe 退出时会自动关闭它启动的 daemon）。
+
+> 💡 高级用户可在 exe 旁创建 `.env` 文件自定义配置（端口、provider 等），运行 `atomcode-proxy.exe --init-config` 可生成配置模板。
+>
+> 📝 日志文件保存在 `logs/atomcode-proxy.log`（exe 同级目录），可通过托盘菜单直接查看。
 
 主要配置项：
 
@@ -43,14 +52,10 @@ flowchart LR
 
 ## 前置条件
 
-1. AtomCode daemon 已启动并监听 `127.0.0.1:13456`：
+- **便携版（exe）**：无需任何前置条件，双击即可运行。程序会自动检测并启动 AtomCode daemon。
+- **源码运行**：需要 Python 3.10+ 和 AtomCode daemon（程序同样会自动启动 daemon）。
 
-```powershell
-Start-Process "C:\Users\Administrator\AppData\Local\AtomCode\atomcode.exe" `
-  -ArgumentList "daemon","--port","13456" -WindowStyle Hidden
-```
-
-2. Python 3.10+，安装依赖：
+安装依赖（源码模式）：
 
 ```bash
 pip install -r requirements.txt
@@ -60,7 +65,13 @@ pip install -r requirements.txt
 
 ```bash
 python run.py
-# 默认监听 127.0.0.1:8765
+# 自动启动 daemon（如未运行）并启动代理，默认监听 127.0.0.1:8765
+```
+
+生成可选配置文件模板：
+
+```bash
+python run.py --init-config
 ```
 
 ## 从源码构建
@@ -82,7 +93,9 @@ python run.py
 
 ## 配置
 
-优先使用 exe 所在目录（开发模式为项目根目录）的 `.env` 文件。首次运行 exe 会自动生成默认 `.env`，按需编辑即可；删除 `.env` 后再次运行也会重新生成。
+所有配置项均有内置默认值，**无需 `.env` 文件即可直接运行**。
+
+如需自定义，可在 exe 旁（开发模式为项目根目录）创建 `.env` 文件，运行 `--init-config` 可生成模板。
 优先级：**已存在的系统环境变量 > `.env` 文件 > 内置默认值**。
 
 | 变量 | 默认值 | 说明 |
