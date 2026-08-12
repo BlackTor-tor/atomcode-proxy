@@ -61,4 +61,5 @@ exe = EXE(
     upx=False,
     console=False,
     onefile=True,
+    icon="assets/logo.ico",
 )

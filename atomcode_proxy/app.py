@@ -1,9 +1,11 @@
 """FastAPI 应用装配：把 OpenAI/Anthropic 适配器挂到 /v1/* 路径。"""
 from __future__ import annotations
 
+import base64
 import logging
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -14,6 +16,18 @@ from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
 
 log = logging.getLogger("atomcode_proxy")
+
+
+def _get_logo_base64() -> str:
+    """读取 Logo 文件并转为 base64。"""
+    logo_paths: list[Path] = []
+    if getattr(sys, "frozen", False):
+        logo_paths.append(Path(sys.executable).resolve().parent / "assets" / "logo.png")
+    logo_paths.append(Path(__file__).resolve().parent.parent / "assets" / "logo.png")
+    for path in logo_paths:
+        if path.exists():
+            return base64.b64encode(path.read_bytes()).decode()
+    return ""
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -50,6 +64,10 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def status_page() -> str:
         """返回 HTML 状态页面。"""
+        logo_b64 = _get_logo_base64()
+        logo_html = ""
+        if logo_b64:
+            logo_html = f'<div style="text-align: center; margin-bottom: 20px;"><img src="data:image/png;base64,{logo_b64}" alt="atomcode-proxy" style="width: 80px; height: 80px;"></div>'
         return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -90,7 +108,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     </style>
 </head>
 <body>
-    <h1>atomcode-proxy</h1>
+    {logo_html}
+    <h1 style="text-align: center;">atomcode-proxy</h1>
     <div class="card">
         <h2>服务状态</h2>
         <p>状态: <span class="status running">运行中</span></p>

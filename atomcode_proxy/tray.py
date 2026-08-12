@@ -10,16 +10,45 @@ from typing import Callable
 log = logging.getLogger("atomcode_proxy.tray")
 
 
+from pathlib import Path
+
+
+def _load_logo_path() -> Path | None:
+    """查找 Logo 文件路径（冻结模式 / 开发模式）。"""
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        # 冻结模式：优先 exe 同级目录，其次 _MEIPASS
+        candidates.append(Path(sys.executable).resolve().parent / "assets" / "logo.png")
+        if hasattr(sys, "_MEIPASS"):
+            candidates.append(Path(sys._MEIPASS) / "assets" / "logo.png")
+    else:
+        # 开发模式：项目 assets 目录
+        candidates.append(Path(__file__).resolve().parent.parent / "assets" / "logo.png")
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
 def _create_tray_icon_image():
-    """使用 Pillow 生成一个简单的绿色圆形图标。"""
+    """加载 Logo 文件作为托盘图标，找不到则回退到绿色圆形。"""
     from PIL import Image, ImageDraw
 
+    logo_path = _load_logo_path()
+    if logo_path is not None:
+        try:
+            img = Image.open(logo_path).convert("RGBA")
+            img = img.resize((64, 64))
+            log.info("已加载 Logo 图标: %s", logo_path)
+            return img
+        except Exception as exc:
+            log.warning("加载 Logo 失败: %s，回退到默认图标", exc)
+
+    # 回退：生成绿色圆形图标
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # 绘制绿色圆形
     draw.ellipse([4, 4, size - 4, size - 4], fill="#22c55e", outline="#16a34a", width=2)
-    # 在中间绘制白色 "A" 字母简化为白色圆点
     draw.ellipse([size // 2 - 8, size // 2 - 8, size // 2 + 8, size // 2 + 8], fill="white")
     return img
 
