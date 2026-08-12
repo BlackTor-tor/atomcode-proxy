@@ -3,3 +3,4 @@ uvicorn[standard]>=0.34
 httpx>=0.28
 pystray>=0.19
 Pillow>=10.0
+python-multipart>=0.0.7

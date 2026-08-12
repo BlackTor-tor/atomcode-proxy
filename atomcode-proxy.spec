@@ -22,15 +22,19 @@ VERSION = _match.group(1) if _match else "0.0.0"
 hiddenimports = collect_submodules("uvicorn")
 
 # 可选依赖：环境未装则跳过（容错）
-for _mod in ("websockets", "httptools", "watchfiles", "pystray", "PIL"):
+for _mod in ("websockets", "httptools", "watchfiles", "pystray", "PIL", "multipart"):
     try:
         __import__(_mod)
         hiddenimports.append(_mod)
     except ImportError:
         pass
 
-# pystray 和 Pillow 的依赖收集
-for _mod in collect_submodules("pystray") + collect_submodules("PIL"):
+# pystray / Pillow / python-multipart 的依赖收集（含情性子模块）
+for _mod in (
+    collect_submodules("pystray")
+    + collect_submodules("PIL")
+    + collect_submodules("multipart")
+):
     if _mod not in hiddenimports:
         hiddenimports.append(_mod)
 
