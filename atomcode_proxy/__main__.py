@@ -9,7 +9,7 @@ import uvicorn
 
 from . import __version__
 from .app import create_app
-from .config import Config
+from .config import Config, DEFAULT_ENV_TEMPLATE, _default_env_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -24,7 +24,16 @@ def _check_port_available(host: str, port: int) -> bool:
             return False
 
 
+def _ensure_env_file() -> None:
+    """若 .env 不存在，自动从内置模板生成一份。"""
+    env_path = _default_env_path()
+    if not env_path.exists():
+        env_path.write_text(DEFAULT_ENV_TEMPLATE, encoding="utf-8")
+        print(f"已生成默认配置文件: {env_path}")
+
+
 def main() -> None:
+    _ensure_env_file()
     cfg = Config.from_env()
 
     print("=" * 52)

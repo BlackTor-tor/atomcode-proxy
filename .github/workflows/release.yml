@@ -76,15 +76,14 @@ jobs:
           tag_name: v${{ env.VERSION }}
           files: |
             atomcode-proxy-${{ env.VERSION }}-windows-x64.exe
-            .env.example
           generate_release_notes: true
           append_body: true
           body: |
             ## 便携版使用说明（Windows）
 
-            1. 下载本 Release 中的 `atomcode-proxy-<版本>-windows-x64.exe` 与 `.env.example`，放到**同一目录**。
-            2. 将 `.env.example` 复制为 `.env`，按需编辑（如 daemon 地址、token、默认模型等）。
-            3. 双击 exe 即可运行：弹出的**控制台窗口即日志**，关闭窗口即停止服务。
+            1. 下载本 Release 中的 `atomcode-proxy-<版本>-windows-x64.exe`。
+            2. 双击 exe 运行：首次启动会自动在当前目录生成 `.env` 配置文件，按需编辑后再次启动即可。
+            3. 弹出的**控制台窗口即日志**，关闭窗口即停止服务。
 
             - 默认监听 `127.0.0.1:8765`
             - 前置条件：AtomCode 本地 daemon 已启动（默认 `http://127.0.0.1:13456`）

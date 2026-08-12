@@ -15,6 +15,19 @@ log = logging.getLogger("atomcode_proxy.config")
 # 项目根目录 = 本文件所在目录的上一级
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# 内置 .env 模板：首次运行且 .env 不存在时自动写入
+DEFAULT_ENV_TEMPLATE = """\
+# 复制为 .env 后按需修改
+ATOMCODE_PROXY_HOST=127.0.0.1
+ATOMCODE_PROXY_PORT=8765
+ATOMCODE_DAEMON_URL=http://127.0.0.1:13456
+ATOMCODE_DAEMON_TOKEN=atomcode_webui
+ATOMCODE_DEFAULT_PROVIDER=AtomGit-deepseek-v4-flash
+ATOMCODE_APPROVAL_MODE=bypass
+ATOMCODE_PROXY_WORKDIR=
+ATOMCODE_MODEL_ALIAS=
+"""
+
 
 def _default_env_path() -> Path:
     """默认 .env 路径：冻结态(PyInstaller)取 exe 旁；否则取项目根目录。"""

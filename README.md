@@ -23,9 +23,9 @@ flowchart LR
 
 使用步骤：
 
-1. 从最新 Release 下载 `atomcode-proxy-<版本>-windows-x64.exe` 与 `.env.example`，放到**同一目录**。
-2. 将 `.env.example` 复制为 `.env`，按需编辑配置。
-3. 双击 exe 即可运行：弹出的**控制台窗口即日志**，关闭窗口即停止服务。默认监听 `127.0.0.1:8765`。
+1. 从最新 Release 下载 `atomcode-proxy-<版本>-windows-x64.exe`。
+2. 双击 exe 运行：首次启动会自动在当前目录生成 `.env` 配置文件，按需编辑后再次启动即可。
+3. 弹出的**控制台窗口即日志**，关闭窗口即停止服务。默认监听 `127.0.0.1:8765`。
 
 主要配置项（完整列表见 `.env.example`）：
 
