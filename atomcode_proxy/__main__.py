@@ -36,6 +36,15 @@ def _check_port_available(host: str, port: int) -> bool:
             return False
 
 
+def _is_port_listening(host: str, port: int) -> bool:
+    """检测端口是否已在监听（可连接即返回 True）。"""
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except (OSError, ConnectionRefusedError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # daemon 健康检查
 # ---------------------------------------------------------------------------
@@ -297,14 +306,43 @@ def main() -> None:
 
     # --- 启动 FastAPI 服务（后台线程）---
     app = create_app(cfg)
-    server_thread = threading.Thread(
-        target=lambda: uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning"),
-        daemon=True,
-    )
+    server_error: list[Exception | None] = [None]
+
+    def _run_server() -> None:
+        try:
+            uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning")
+        except Exception as exc:
+            server_error[0] = exc
+            log.error("uvicorn 启动失败: %s", exc, exc_info=True)
+
+    server_thread = threading.Thread(target=_run_server, daemon=True)
     server_thread.start()
 
-    # 等待服务就绪
-    time.sleep(1.5)
+    # 等待服务就绪（最多 10 秒）
+    server_ready = False
+    for _ in range(40):
+        time.sleep(0.25)
+        if server_error[0] is not None:
+            break
+        if _is_port_listening(cfg.host, cfg.port):
+            server_ready = True
+            break
+
+    if server_error[0] is not None:
+        log.error("服务启动失败: %s", server_error[0])
+        print(f"[错误] 服务启动失败: {server_error[0]}")
+        print("请检查日志获取详细信息。")
+        if not getattr(sys, "frozen", False):
+            input("按回车键退出...")
+        sys.exit(1)
+
+    if not server_ready:
+        log.error("服务启动超时（等待 10 秒后仍无法连接）")
+        print(f"[错误] 服务启动超时，无法监听 {cfg.host}:{cfg.port}")
+        if not getattr(sys, "frozen", False):
+            input("按回车键退出...")
+        sys.exit(1)
+
     log.info("服务已就绪: http://%s:%s", cfg.host, cfg.port)
 
     # --- 自动打开浏览器 ---

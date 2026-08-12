@@ -2,7 +2,8 @@
 """PyInstaller spec: 打包 atomcode-proxy 为单文件 exe。
 
 注意：
-- 严禁添加 datas，.env 绝不打包进 exe（由 exe 旁的 .env 提供配置）。
+- .env 绝不打包进 exe（由 exe 旁的 .env 提供配置）。
+- assets/ 目录（Logo 等）必须打包进 exe，运行时解压到 _MEIPASS。
 - 不收集 uvloop（Windows 不可用）。
 """
 import re
@@ -37,7 +38,7 @@ a = Analysis(
     ["run.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[("assets", "assets")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
