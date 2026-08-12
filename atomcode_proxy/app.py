@@ -90,6 +90,19 @@ def create_app(config: Config | None = None) -> FastAPI:
         ("ATOMCODE_MODEL_ALIAS", "模型别名 (k=v,k2=v2)", "text", None),
     ]
 
+    # 内置默认值：.env 文件和系统环境变量均未覆盖时，设置页回退显示这些值。
+    # 取自 cfg（已合并 .env / 环境变量 / 内置默认），避免默认值重复定义。
+    _BUILTIN_DEFAULTS: dict[str, str] = {
+        "ATOMCODE_PROXY_HOST": cfg.host,
+        "ATOMCODE_PROXY_PORT": str(cfg.port),
+        "ATOMCODE_DAEMON_URL": cfg.daemon_url,
+        "ATOMCODE_DAEMON_TOKEN": cfg.daemon_token,
+        "ATOMCODE_DEFAULT_PROVIDER": cfg.default_provider,
+        "ATOMCODE_APPROVAL_MODE": cfg.approval_mode,
+        "ATOMCODE_PROXY_WORKDIR": cfg.working_dir,
+        "ATOMCODE_MODEL_ALIAS": "",
+    }
+
     def _read_env_file() -> dict[str, str]:
         """读取 .env 文件，返回 {key: value} 字典（忽略注释行）。"""
         env_path = _default_env_path()
@@ -134,10 +147,13 @@ def create_app(config: Config | None = None) -> FastAPI:
         return env_path
 
     def _current_value(field_name: str, env_vals: dict[str, str]) -> str:
-        """获取字段当前值：优先 .env 文件，其次环境变量，最后默认值。"""
+        """获取字段当前值：优先 .env 文件，其次环境变量，最后内置默认值。"""
         if field_name in env_vals:
             return env_vals[field_name]
-        return os.environ.get(field_name, "")
+        val = os.environ.get(field_name, "")
+        if val:
+            return val
+        return _BUILTIN_DEFAULTS.get(field_name, "")
 
     def _settings_html(env_vals: dict[str, str], message: str = "") -> str:
         """生成设置页面 HTML。"""
