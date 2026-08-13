@@ -84,6 +84,7 @@ class SystemTray:
             menu_items = [
                 Item("打开状态页面", self._open_status_page),
                 Item("打开设置页面", self._open_settings_page),
+                Item("检查更新", self._check_update),
                 Item("显示日志", self._open_log_file),
                 pystray.Menu.SEPARATOR,
                 Item("退出", self._quit),
@@ -113,6 +114,12 @@ class SystemTray:
         """打开浏览器访问设置页面。"""
         url = f"http://{self.host}:{self.port}/settings"
         log.info("打开设置页面: %s", url)
+        webbrowser.open(url)
+
+    def _check_update(self, icon=None, item=None) -> None:
+        """打开状态页面检查更新（页面加载时自动查询 GitHub Releases）。"""
+        url = f"http://{self.host}:{self.port}/"
+        log.info("检查更新，打开状态页面: %s", url)
         webbrowser.open(url)
 
     def _open_log_file(self, icon=None, item=None) -> None:

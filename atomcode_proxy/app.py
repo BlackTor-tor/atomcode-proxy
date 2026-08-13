@@ -16,6 +16,11 @@ from . import __version__
 from .config import Config, _default_env_path
 from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
+from .updater import (
+    GITHUB_RELEASES_URL,
+    check_for_update,
+    download_latest_release,
+)
 
 log = logging.getLogger("atomcode_proxy")
 
@@ -62,6 +67,47 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/version")
     async def version() -> dict:
         return {"name": "atomcode-proxy", "version": __version__, "frozen": getattr(sys, "frozen", False)}
+
+    # ── 检查更新 API ─────────────────────────────────────────────
+
+    @app.get("/api/update/check")
+    async def api_check_update() -> JSONResponse:
+        """查询 GitHub Releases 是否有新版本。"""
+        try:
+            result = await check_for_update(__version__)
+            if result is None:
+                return JSONResponse({"has_update": False, "current_version": __version__})
+            return JSONResponse({"has_update": True, **result})
+        except Exception as e:
+            log.warning("检查更新失败: %s", e)
+            return JSONResponse(status_code=502, content={"error": str(e)})
+
+    @app.get("/api/update/download")
+    async def api_download_update() -> JSONResponse:
+        """下载最新版本 exe 到本地下载目录。"""
+        try:
+            update_info = await check_for_update(__version__)
+            if update_info is None:
+                return JSONResponse(status_code=404, content={"error": "无可用更新"})
+            path = await download_latest_release(update_info)
+            if path is None:
+                tag = update_info.get("latest_version", "")
+                fallback_url = f"{GITHUB_RELEASES_URL}/tag/v{tag}"
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": "下载失败",
+                        "fallback_url": fallback_url,
+                    },
+                )
+            return JSONResponse({
+                "success": True,
+                "path": str(path),
+                "version": update_info.get("latest_version", ""),
+            })
+        except Exception as e:
+            log.warning("下载更新失败: %s", e)
+            return JSONResponse(status_code=502, content={"error": str(e)})
 
     # ── 模型列表 API ─────────────────────────────────────────────
 
@@ -404,15 +450,46 @@ def create_app(config: Config | None = None) -> FastAPI:
             font-size: 12px;
             margin: 2px;
         }}
+        .update-banner {{
+            background: #fff3cd;
+            border: 1px solid #ffe08a;
+            border-radius: 8px;
+            padding: 16px 20px;
+            margin: 20px 0;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+        }}
+        .btn {{
+            display: inline-block;
+            padding: 8px 20px;
+            background: #2563eb;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+        }}
+        .btn:hover {{ background: #1d4ed8; }}
+        .btn:disabled {{ background: #9ca3af; cursor: not-allowed; }}
+        .btn-small {{
+            padding: 4px 14px;
+            font-size: 13px;
+            margin-left: 8px;
+        }}
     </style>
 </head>
 <body>
     {logo_html}
     <h1 style="text-align: center;">atomcode-proxy</h1>
+    <div id="update-banner" class="update-banner" style="display:none;">
+        <div id="update-banner-content" style="flex:1; min-width:200px;"></div>
+    </div>
     <div class="card">
         <h2>服务状态</h2>
         <p>状态: <span class="status running">运行中</span></p>
-        <p>版本: {__version__}</p>
+        <p>版本: {__version__} <button id="check-update-btn" class="btn btn-small" onclick="checkForUpdate()">检查更新</button></p>
         <p>监听地址: <code>http://{cfg.host}:{cfg.port}</code></p>
     </div>
     <div class="card">
@@ -453,6 +530,75 @@ def create_app(config: Config | None = None) -> FastAPI:
                 el.innerHTML = '<p class="info" style="color:#dc3545;">无法获取模型列表: ' + err.message + '</p>';
             }});
     }})();
+    </script>
+    <script>
+    // 自动检查更新
+    checkForUpdate();
+
+    function checkForUpdate() {{
+        var btn = document.getElementById("check-update-btn");
+        if (btn) {{ btn.disabled = true; btn.textContent = "检查中..."; }}
+        fetch("/api/update/check")
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                var banner = document.getElementById("update-banner");
+                var content = document.getElementById("update-banner-content");
+                if (data.has_update) {{
+                    banner.style.display = "flex";
+                    var html = '<strong>🎉 发现新版本！</strong> ';
+                    html += data.current_version + ' &rarr; <strong>v' + data.latest_version + '</strong>';
+                    if (data.download_url) {{
+                        html += ' <button id="download-btn" class="btn" onclick="downloadUpdate()">下载更新</button>';
+                        html += ' <span id="download-status"></span>';
+                    }} else {{
+                        html += ' <a href="' + data.release_url + '" target="_blank" class="btn">前往下载</a>';
+                    }}
+                    content.innerHTML = html;
+                }} else {{
+                    banner.style.display = "none";
+                    if (btn) {{
+                        btn.textContent = "已是最新";
+                        setTimeout(function() {{ btn.textContent = "检查更新"; btn.disabled = false; }}, 2000);
+                    }}
+                }}
+            }})
+            .catch(function() {{
+                if (btn) {{ btn.textContent = "检查更新"; btn.disabled = false; }}
+            }});
+    }}
+
+    function downloadUpdate() {{
+        var btn = document.getElementById("download-btn");
+        var status = document.getElementById("download-status");
+        if (btn) {{ btn.disabled = true; btn.textContent = "正在下载..."; }}
+        if (status) {{ status.textContent = ""; }}
+        fetch("/api/update/download")
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                if (data.success) {{
+                    if (btn) {{ btn.style.display = "none"; }}
+                    if (status) {{
+                        status.innerHTML = '<span style="color:#155724;">✅ 下载完成！文件已保存到：<code>' + data.path + '</code></span>';
+                    }}
+                }} else if (data.fallback_url) {{
+                    if (btn) {{ btn.style.display = "none"; }}
+                    if (status) {{
+                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + data.fallback_url + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + data.fallback_url + '</a> 进行下载</span>';
+                    }}
+                }} else {{
+                    if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
+                    if (status) {{
+                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败：' + (data.error || "未知错误") + '</span>';
+                    }}
+                }}
+            }})
+            .catch(function() {{
+                if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
+                if (status) {{
+                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请稍后重试或手动到 GitHub Releases 下载</span>';
+                }}
+            }});
+    }}
     </script>
 </body>
 </html>"""
