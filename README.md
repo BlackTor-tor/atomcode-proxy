@@ -1,5 +1,9 @@
 # atomcode-proxy
 
+<p align="center">
+  <img src="assets/logo.png" alt="atomcode-proxy" width="120" />
+</p>
+
 把 OpenAI / Anthropic 兼容协议翻译为 AtomCode 本地 daemon 协议的适配代理，
 使 Codex CLI、Cursor 等工具可以直接使用 AtomCode 的云端模型。
 
