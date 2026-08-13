@@ -37,6 +37,26 @@ def _get_logo_base64() -> str:
     return ""
 
 
+def _is_local_download_source(request: Request, cfg: Config) -> bool:
+    """校验下载请求来源是否为本服务页面（防跨站写盘）。
+
+    恶意网页/局域网主机发起的请求会携带其自身的 Origin/Referer，
+    与本服务地址不匹配即拒绝；无来源头的直连请求（如 curl）放行。
+    """
+    allowed = {
+        f"http://{cfg.host}:{cfg.port}",
+        f"http://127.0.0.1:{cfg.port}",
+        f"http://localhost:{cfg.port}",
+        f"http://[::1]:{cfg.port}",
+    }
+    origin = request.headers.get("origin", "")
+    referer = request.headers.get("referer", "")
+    for value in (origin, referer):
+        if value and not any(value == p or value.startswith(p + "/") for p in allowed):
+            return False
+    return True
+
+
 def create_app(config: Config | None = None) -> FastAPI:
     cfg = config or Config.from_env()
 
@@ -82,17 +102,26 @@ def create_app(config: Config | None = None) -> FastAPI:
             log.warning("检查更新失败: %s", e)
             return JSONResponse(status_code=502, content={"error": str(e)})
 
-    @app.get("/api/update/download")
-    async def api_download_update() -> JSONResponse:
-        """下载最新版本 exe 到本地下载目录。"""
+    @app.post("/api/update/download")
+    async def api_download_update(request: Request) -> JSONResponse:
+        """下载最新版本 exe 到本地下载目录。
+
+        仅接受来自本服务页面的 POST 请求，防止恶意网页/局域网主机
+        通过跨站请求触发写盘。
+        """
+        if not _is_local_download_source(request, cfg):
+            log.warning("拒绝来自非本服务来源的下载请求")
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         try:
             update_info = await check_for_update(__version__)
             if update_info is None:
                 return JSONResponse(status_code=404, content={"error": "无可用更新"})
             path = await download_latest_release(update_info)
             if path is None:
-                tag = update_info.get("latest_version", "")
-                fallback_url = f"{GITHUB_RELEASES_URL}/tag/v{tag}"
+                # 优先使用 GitHub API 返回的权威 release 页链接，避免拼接 tag 格式漂移导致 404
+                fallback_url = update_info.get("release_url") or (
+                    f"{GITHUB_RELEASES_URL}/tag/v{update_info.get('latest_version', '')}"
+                )
                 return JSONResponse(
                     status_code=502,
                     content={
@@ -532,8 +561,13 @@ def create_app(config: Config | None = None) -> FastAPI:
     }})();
     </script>
     <script>
-    // 自动检查更新
-    checkForUpdate();
+    // 服务端注入的 GitHub Releases 下载页链接（失败兜底提示用）
+    var RELEASES_URL = "{GITHUB_RELEASES_URL}";
+
+    // 通过 ?check_update=1 进入（托盘「检查更新」入口）时自动触发一次检查
+    if (location.search.indexOf("check_update") !== -1) {{
+        checkForUpdate();
+    }}
 
     function checkForUpdate() {{
         var btn = document.getElementById("check-update-btn");
@@ -544,6 +578,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 var banner = document.getElementById("update-banner");
                 var content = document.getElementById("update-banner-content");
                 if (data.has_update) {{
+                    if (btn) {{ btn.textContent = "有新版本"; btn.disabled = false; }}
                     banner.style.display = "flex";
                     var html = '<strong>🎉 发现新版本！</strong> ';
                     html += data.current_version + ' &rarr; <strong>v' + data.latest_version + '</strong>';
@@ -563,7 +598,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 }}
             }})
             .catch(function() {{
-                if (btn) {{ btn.textContent = "检查更新"; btn.disabled = false; }}
+                if (btn) {{ btn.textContent = "检查失败，点击重试"; btn.disabled = false; }}
             }});
     }}
 
@@ -572,7 +607,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         var status = document.getElementById("download-status");
         if (btn) {{ btn.disabled = true; btn.textContent = "正在下载..."; }}
         if (status) {{ status.textContent = ""; }}
-        fetch("/api/update/download")
+        fetch("/api/update/download", {{ method: "POST" }})
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 if (data.success) {{
@@ -588,14 +623,14 @@ def create_app(config: Config | None = None) -> FastAPI:
                 }} else {{
                     if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
                     if (status) {{
-                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败：' + (data.error || "未知错误") + '</span>';
+                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败：' + (data.error || "未知错误") + '，请到下载页：<a href="' + RELEASES_URL + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + RELEASES_URL + '</a> 进行下载</span>';
                     }}
                 }}
             }})
             .catch(function() {{
                 if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
                 if (status) {{
-                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请稍后重试或手动到 GitHub Releases 下载</span>';
+                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + RELEASES_URL + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + RELEASES_URL + '</a> 进行下载</span>';
                 }}
             }});
     }}

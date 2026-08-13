@@ -104,21 +104,26 @@ class SystemTray:
             log.warning("系统托盘初始化失败: %s，回退到控制台模式", exc)
             self._fallback_console_mode()
 
+    def _page_url(self, path: str = "/") -> str:
+        """构造页面 URL；0.0.0.0/:: 等通配地址改用 127.0.0.1 供浏览器访问。"""
+        host = self.host if self.host not in ("0.0.0.0", "::") else "127.0.0.1"
+        return f"http://{host}:{self.port}{path}"
+
     def _open_status_page(self, icon=None, item=None) -> None:
         """打开浏览器访问状态页面。"""
-        url = f"http://{self.host}:{self.port}/"
+        url = self._page_url("/")
         log.info("打开状态页面: %s", url)
         webbrowser.open(url)
 
     def _open_settings_page(self, icon=None, item=None) -> None:
         """打开浏览器访问设置页面。"""
-        url = f"http://{self.host}:{self.port}/settings"
+        url = self._page_url("/settings")
         log.info("打开设置页面: %s", url)
         webbrowser.open(url)
 
     def _check_update(self, icon=None, item=None) -> None:
-        """打开状态页面检查更新（页面加载时自动查询 GitHub Releases）。"""
-        url = f"http://{self.host}:{self.port}/"
+        """打开状态页面并触发一次更新检查（页面读取 ?check_update=1 参数）。"""
+        url = self._page_url("/?check_update=1")
         log.info("检查更新，打开状态页面: %s", url)
         webbrowser.open(url)
 
