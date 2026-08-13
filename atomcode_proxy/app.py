@@ -9,8 +9,10 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, Form, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+
+import httpx
 
 from . import __version__
 from .config import Config, _default_env_path
@@ -19,7 +21,6 @@ from . import anthropic_adapter, openai_adapter
 from .updater import (
     GITHUB_RELEASES_URL,
     check_for_update,
-    download_latest_release,
 )
 
 log = logging.getLogger("atomcode_proxy")
@@ -103,40 +104,91 @@ def create_app(config: Config | None = None) -> FastAPI:
             return JSONResponse(status_code=502, content={"error": str(e)})
 
     @app.post("/api/update/download")
-    async def api_download_update(request: Request) -> JSONResponse:
-        """下载最新版本 exe 到本地下载目录。
+    async def api_download_update(request: Request) -> Response:
+        """代理下载最新版本 exe：后端流式转发 GitHub 字节流，由浏览器
+        保存到其默认下载路径（不写服务端本地文件）。
 
         仅接受来自本服务页面的 POST 请求，防止恶意网页/局域网主机
-        通过跨站请求触发写盘。
+        通过跨站请求触发下载。
         """
         if not _is_local_download_source(request, cfg):
             log.warning("拒绝来自非本服务来源的下载请求")
             return JSONResponse(status_code=403, content={"error": "禁止的来源"})
+
         try:
             update_info = await check_for_update(__version__)
-            if update_info is None:
-                return JSONResponse(status_code=404, content={"error": "无可用更新"})
-            path = await download_latest_release(update_info)
-            if path is None:
-                # 优先使用 GitHub API 返回的权威 release 页链接，避免拼接 tag 格式漂移导致 404
-                fallback_url = update_info.get("release_url") or (
-                    f"{GITHUB_RELEASES_URL}/tag/v{update_info.get('latest_version', '')}"
-                )
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "error": "下载失败",
-                        "fallback_url": fallback_url,
-                    },
-                )
-            return JSONResponse({
-                "success": True,
-                "path": str(path),
-                "version": update_info.get("latest_version", ""),
-            })
         except Exception as e:
-            log.warning("下载更新失败: %s", e)
+            log.warning("检查更新失败: %s", e)
             return JSONResponse(status_code=502, content={"error": str(e)})
+        if update_info is None:
+            return JSONResponse(status_code=404, content={"error": "无可用更新"})
+
+        # 优先使用 GitHub API 返回的权威 release 页链接，避免拼接 tag 格式漂移导致 404
+        fallback_url = update_info.get("release_url") or (
+            f"{GITHUB_RELEASES_URL}/tag/v{update_info.get('latest_version', '')}"
+        )
+        download_url = update_info.get("download_url", "")
+        if not download_url:
+            return JSONResponse(
+                status_code=502,
+                content={"error": "无可用下载链接", "fallback_url": fallback_url},
+            )
+
+        filename = (
+            update_info.get("asset_name")
+            or download_url.rsplit("/", 1)[-1]
+            or f"atomcode-proxy-{update_info.get('latest_version', 'unknown')}-windows-x64.exe"
+        )
+
+        # 从 GitHub 流式拉取并转发给浏览器
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0),
+            follow_redirects=True,
+        )
+        try:
+            resp = await client.send(
+                client.build_request("GET", download_url, headers={"User-Agent": "atomcode-proxy-updater"}),
+                stream=True,
+            )
+        except Exception as exc:
+            await client.aclose()
+            log.warning("连接 GitHub 下载源失败: %s", exc)
+            return JSONResponse(
+                status_code=502,
+                content={"error": "下载失败", "fallback_url": fallback_url},
+            )
+        if resp.status_code >= 400:
+            await resp.aclose()
+            await client.aclose()
+            log.warning("GitHub 下载源返回 %s", resp.status_code)
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"下载源返回 {resp.status_code}", "fallback_url": fallback_url},
+            )
+
+        async def _stream():
+            """转发 GitHub 字节流；结束后关闭上游连接。"""
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        headers = {
+            # attachment 提示浏览器保存为文件；X-Filename 供前端读取文件名
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Filename": filename,
+        }
+        content_length = resp.headers.get("content-length", "")
+        if content_length:
+            headers["Content-Length"] = content_length
+        log.info("开始代理下载: %s (%s bytes)", download_url, content_length or "unknown")
+        return StreamingResponse(
+            _stream(),
+            media_type="application/octet-stream",
+            headers=headers,
+        )
 
     # ── 模型列表 API ─────────────────────────────────────────────
 
@@ -728,29 +780,35 @@ def create_app(config: Config | None = None) -> FastAPI:
         if (btn) {{ btn.disabled = true; btn.textContent = "正在下载..."; }}
         if (status) {{ status.textContent = ""; }}
         fetch("/api/update/download", {{ method: "POST" }})
-            .then(function(r) {{ return r.json(); }})
+            .then(function(r) {{
+                if (!r.ok) {{
+                    // 后端返回 JSON 错误（含 fallback_url 兜底链接）
+                    return r.json().catch(function() {{ return {{ error: "HTTP " + r.status }}; }})
+                        .then(function(d) {{ throw d; }});
+                }}
+                var filename = r.headers.get("X-Filename") || "update.exe";
+                return r.blob().then(function(blob) {{ return {{ blob: blob, filename: filename }}; }});
+            }})
             .then(function(data) {{
-                if (data.success) {{
-                    if (btn) {{ btn.style.display = "none"; }}
-                    if (status) {{
-                        status.innerHTML = '<span style="color:#155724;">✅ 下载完成！文件已保存到：<code>' + data.path + '</code></span>';
-                    }}
-                }} else if (data.fallback_url) {{
-                    if (btn) {{ btn.style.display = "none"; }}
-                    if (status) {{
-                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + data.fallback_url + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + data.fallback_url + '</a> 进行下载</span>';
-                    }}
-                }} else {{
-                    if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
-                    if (status) {{
-                        status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败：' + (data.error || "未知错误") + '，请到下载页：<a href="' + RELEASES_URL + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + RELEASES_URL + '</a> 进行下载</span>';
-                    }}
+                // 交给浏览器保存到其默认下载路径
+                var url = URL.createObjectURL(data.blob);
+                var a = document.createElement("a");
+                a.href = url;
+                a.download = data.filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(function() {{ URL.revokeObjectURL(url); }}, 10000);
+                if (btn) {{ btn.style.display = "none"; }}
+                if (status) {{
+                    status.innerHTML = '<span style="color:#155724;">✅ 下载已开始，保存位置由浏览器决定，请查看浏览器下载列表</span>';
                 }}
             }})
-            .catch(function() {{
+            .catch(function(err) {{
                 if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
+                var fallback = err && err.fallback_url ? err.fallback_url : RELEASES_URL;
                 if (status) {{
-                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + RELEASES_URL + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + RELEASES_URL + '</a> 进行下载</span>';
+                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + fallback + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + fallback + '</a> 进行下载</span>';
                 }}
             }});
     }}

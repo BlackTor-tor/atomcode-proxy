@@ -1,15 +1,13 @@
-"""检查更新模块：查询 GitHub Releases 获取最新版本并下载。
+"""检查更新模块：查询 GitHub Releases 获取最新版本信息。
 
 - check_for_update()：对比当前版本与 GitHub 最新 release
-- download_latest_release()：下载最新 release 的 exe 资产到本地下载目录
+- 下载由 app.py 流式代理转发，浏览器保存到其默认下载路径
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
-from pathlib import Path
 
 import httpx
 
@@ -159,60 +157,3 @@ async def _fetch_latest_via_redirect() -> dict | None:
         "release_notes": "",
         "published_at": "",
     }
-
-
-# 下载单飞锁：同一文件的并发下载请求复用同一次下载，避免交叉写损坏产物
-_download_lock = asyncio.Lock()
-
-
-async def download_latest_release(update_info: dict) -> Path | None:
-    """下载最新版本 exe 到用户下载目录，返回本地文件路径。
-
-    失败返回 None（由调用方展示兜底提示）。先写 .part 临时文件，
-    成功后原子替换，失败只清理临时文件、绝不删除已有正式文件。
-    """
-    download_url = update_info.get("download_url", "")
-    if not download_url:
-        log.warning("无可用下载链接")
-        return None
-
-    # 下载目录：优先用户 Downloads 文件夹，回退到主目录
-    downloads_dir = Path.home() / "Downloads"
-    if not downloads_dir.exists():
-        downloads_dir = Path.home()
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-
-    # 从 URL 或 update_info 提取文件名
-    filename = download_url.rsplit("/", 1)[-1]
-    if not filename:
-        filename = update_info.get("asset_name") or f"atomcode-proxy-{update_info.get('latest_version', 'unknown')}-windows-x64.exe"
-    target = downloads_dir / filename
-
-    async with _download_lock:
-        # 已有同名完整文件（原子替换保证完整性）时视为已下载
-        if target.exists():
-            log.info("目标文件已存在: %s", target)
-            return target
-
-        tmp = target.with_suffix(target.suffix + ".part")
-        try:
-            log.info("开始下载更新: %s -> %s", download_url, target)
-            timeout = httpx.Timeout(300.0, connect=30.0)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                async with client.stream("GET", download_url, headers=_UA) as resp:
-                    resp.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            # 写盘放到线程池，避免阻塞事件循环拖慢 /v1/* 转发
-                            await asyncio.to_thread(f.write, chunk)
-            tmp.replace(target)  # 原子替换
-            log.info("下载完成: %s (%.2f MB)", target, target.stat().st_size / 1024 / 1024)
-            return target
-        except Exception as exc:
-            log.warning("下载更新失败: %s", exc)
-            # 只清理本次写入的临时文件，绝不删除已存在的正式文件
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return None
