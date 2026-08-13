@@ -69,8 +69,9 @@ def _resolve_working_dir() -> str:
     return os.environ.get("ATOMCODE_PROXY_WORKDIR") or os.path.expanduser("~")
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
+    """运行时可变的配置对象：网页保存的热更新直接改字段即可。"""
     host: str = field(default_factory=lambda: os.environ.get("ATOMCODE_PROXY_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.environ.get("ATOMCODE_PROXY_PORT", "8765")))
 
@@ -95,7 +96,7 @@ class Config:
                 if k and v:
                     aliases[k.strip()] = v.strip()
         cfg = cls()
-        object.__setattr__(cfg, "model_alias", aliases)
+        cfg.model_alias = aliases
         return cfg
 
     def resolve_provider(self, model: str | None) -> str:

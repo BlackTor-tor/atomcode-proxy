@@ -221,8 +221,25 @@ def create_app(config: Config | None = None) -> FastAPI:
             env_path.write_text("".join(parts), encoding="utf-8")
         return env_path
 
-    def _current_value(field_name: str, env_vals: dict[str, str]) -> str:
-        """获取字段当前值：优先 .env 文件，其次环境变量，最后内置默认值。"""
+    def _runtime_values() -> dict[str, str]:
+        """运行时配置快照（网页热更新后的值，优先于 .env 显示）。"""
+        c = app.state.config
+        return {
+            "ATOMCODE_PROXY_HOST": c.host,
+            "ATOMCODE_PROXY_PORT": str(c.port),
+            "ATOMCODE_DAEMON_URL": c.daemon_url,
+            "ATOMCODE_DAEMON_TOKEN": c.daemon_token,
+            "ATOMCODE_DEFAULT_PROVIDER": c.default_provider,
+            "ATOMCODE_APPROVAL_MODE": c.approval_mode,
+            "ATOMCODE_PROXY_WORKDIR": c.working_dir,
+            "ATOMCODE_MODEL_ALIAS": ",".join(f"{k}={v}" for k, v in c.model_alias.items()),
+        }
+
+    def _current_value(field_name: str, env_vals: dict[str, str], runtime: dict[str, str]) -> str:
+        """获取字段当前值：优先运行时配置（网页热更新值），其次 .env 文件，
+        再环境变量，最后内置默认值。模型别名允许运行时为空（可清空）。"""
+        if field_name in runtime and (runtime[field_name] or field_name == "ATOMCODE_MODEL_ALIAS"):
+            return runtime[field_name]
         if field_name in env_vals:
             return env_vals[field_name]
         val = os.environ.get(field_name, "")
@@ -230,8 +247,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             return val
         return _BUILTIN_DEFAULTS.get(field_name, "")
 
-    def _settings_html(env_vals: dict[str, str], message: str = "") -> str:
+    def _settings_html(env_vals: dict[str, str], message: str = "", runtime: dict[str, str] | None = None) -> str:
         """生成设置页面 HTML。"""
+        runtime = runtime or {}
         logo_b64 = _get_logo_base64()
         logo_html = ""
         if logo_b64:
@@ -243,7 +261,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         fields_html = ""
         for field_name, label, input_type, options in _SETTING_FIELDS:
-            val = _current_value(field_name, env_vals)
+            val = _current_value(field_name, env_vals, runtime)
             if input_type == "select" and options:
                 opts = "".join(
                     f'<option value="{o}" {"selected" if val == o else ""}>{o}</option>'
@@ -382,6 +400,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             {fields_html}
         </div>
         <div style="text-align:center; margin: 20px 0;">
+            <label style="display:inline-flex; align-items:center; gap:6px; font-size:14px; color:#555; margin-bottom:14px; cursor:pointer;">
+                <input type="checkbox" name="save_to_env" value="on" style="width:16px;height:16px;">
+                同时保存到 .env 文件（重启后仍生效；不勾选则仅当前运行生效）
+            </label>
+            <br>
             <button type="submit" class="btn">保存配置</button>
         </div>
     </form>
@@ -395,23 +418,120 @@ def create_app(config: Config | None = None) -> FastAPI:
     async def settings_page() -> str:
         """返回设置页面 HTML 表单。"""
         env_vals = _read_env_file()
-        return _settings_html(env_vals)
+        return _settings_html(env_vals, runtime=_runtime_values())
 
     @app.post("/settings", response_class=HTMLResponse)
     async def settings_save(request: Request) -> str:
-        """接收表单数据并保存到 .env 文件。"""
+        """接收表单数据：热更新内存配置，不写 .env 也立即生效。
+
+        监听地址/端口运行时无法变更（服务已绑定），仅当勾选「保存到 .env」
+        时写入供重启后生效。
+        """
         form = await request.form()
         updates: dict[str, str] = {}
         for field_name, _, input_type, _ in _SETTING_FIELDS:
             val = form.get(field_name, "")
             if val is not None:
                 updates[field_name] = str(val)
-        env_path = _write_env_file(updates)
-        log.info("配置已保存到: %s", env_path)
+        save_to_env = str(form.get("save_to_env", "")).lower() in ("on", "1", "true")
+
+        messages = await _apply_settings(app, updates, save_to_env)
         return _settings_html(
             _read_env_file(),
-            message=f"配置已保存到 {env_path}。请重启服务以使新配置生效。",
+            message="<br>".join(messages),
+            runtime=_runtime_values(),
         )
+
+    async def _apply_settings(app: FastAPI, updates: dict[str, str], save_to_env: bool) -> list[str]:
+        """把表单修改热更新到运行时配置；save_to_env 为真时同步写 .env。
+
+        返回提示消息列表。
+        """
+        cfg = app.state.config
+        messages: list[str] = []
+
+        # 监听地址/端口：服务已绑定，运行时无法变更；仅勾选持久化时写 .env
+        host = updates.get("ATOMCODE_PROXY_HOST", "").strip()
+        port_raw = updates.get("ATOMCODE_PROXY_PORT", "").strip()
+        host_changed = bool(host) and host != cfg.host
+        port_changed = False
+        if port_raw:
+            try:
+                if not 1 <= int(port_raw) <= 65535:
+                    messages.append("端口无效（1-65535），本次未修改端口")
+                else:
+                    port_changed = int(port_raw) != cfg.port
+            except ValueError:
+                messages.append("端口无效（1-65535），本次未修改端口")
+        if host_changed or port_changed:
+            if save_to_env:
+                messages.append("监听地址/端口已保存到 .env，重启服务后生效")
+            else:
+                messages.append("监听地址/端口需重启生效：请勾选「保存到 .env」后再次保存")
+
+        # 默认 Provider / 审批模式 / 工作目录：热更新，立即生效
+        new_provider = updates.get("ATOMCODE_DEFAULT_PROVIDER", "").strip()
+        new_mode = updates.get("ATOMCODE_APPROVAL_MODE", "").strip()
+        new_workdir = updates.get("ATOMCODE_PROXY_WORKDIR", "").strip()
+        if new_provider:
+            cfg.default_provider = new_provider
+        if new_mode:
+            cfg.approval_mode = new_mode
+        if new_workdir:
+            cfg.working_dir = new_workdir
+
+        # 模型别名：解析 k=v 列表（允许清空）
+        aliases: dict[str, str] = {}
+        raw = updates.get("ATOMCODE_MODEL_ALIAS", "")
+        for pair in raw.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                if k.strip() and v.strip():
+                    aliases[k.strip()] = v.strip()
+        cfg.model_alias = aliases
+
+        # Daemon 地址/Token：变化则重建 daemon 客户端（用新 cfg），立即生效
+        new_daemon_url = updates.get("ATOMCODE_DAEMON_URL", "").strip() or cfg.daemon_url
+        new_daemon_token = updates.get("ATOMCODE_DAEMON_TOKEN", "").strip()
+        daemon_url_changed = new_daemon_url != cfg.daemon_url
+        daemon_token_changed = bool(new_daemon_token) and new_daemon_token != cfg.daemon_token
+        if daemon_url_changed or daemon_token_changed:
+            cfg.daemon_url = new_daemon_url
+            if new_daemon_token:
+                cfg.daemon_token = new_daemon_token
+            try:
+                old = app.state.daemon
+                if old is not None:
+                    await old.close()
+                app.state.daemon = AtomCodeDaemon(
+                    cfg.daemon_url,
+                    daemon_token=cfg.daemon_token,
+                    default_provider=cfg.default_provider,
+                    approval_mode=cfg.approval_mode,
+                    default_working_dir=cfg.working_dir,
+                )
+                messages.append("Daemon 连接已更新并立即生效（原有会话上下文已重置）")
+            except Exception as exc:
+                log.warning("重建 daemon 客户端失败: %s", exc)
+                messages.append(f"Daemon 配置已保存，但重建连接失败: {exc}")
+        else:
+            # daemon_url/token 未变：同步 provider/mode/workdir 到现有客户端
+            daemon = getattr(app.state, "daemon", None)
+            if isinstance(daemon, AtomCodeDaemon):
+                daemon.default_provider = cfg.default_provider
+                daemon.approval_mode = cfg.approval_mode
+                daemon.default_working_dir = cfg.working_dir
+
+        messages.append("配置已保存并立即生效")
+
+        # 可选持久化到 .env
+        if save_to_env:
+            env_path = _write_env_file(updates)
+            messages.append(f"已同步保存到 {env_path}")
+        else:
+            messages.append("未写入 .env：修改仅当前运行生效，重启后回到 .env/环境变量的值")
+
+        return messages
 
     @app.get("/", response_class=HTMLResponse)
     async def status_page() -> str:
