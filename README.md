@@ -160,6 +160,20 @@ $env:ANTHROPIC_AUTH_TOKEN = "dummy"
 claude
 ```
 
+### DeepSeek Harness（dsh）
+
+1. 本地部署 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 后，运行 `dsh web`。
+2. 打开 Web UI（默认 `http://127.0.0.1:3080/`），点击 **设置 → 模型 → 自定义设置**：
+
+   - API 地址：`http://127.0.0.1:8765/v1`
+   - 密钥：任意非空值即可（代理不校验）
+   - 自定义模型名称：`AtomGit-deepseek-v4-flash`、`AtomGit-Qwen-Qwen3-VL-8B-Instruct`
+   - 实际模型：`DeepSeek-V4-Flash`、`Qwen-Qwen3-VL-8B-Instruct`
+
+   配置效果见下图：
+
+   ![dsh Web UI 自定义模型配置](assets/dsh-webui-config.png)
+
 ### Cline / Roo Code（VS Code 插件，OpenAI 兼容）
 
 API Provider 选 **OpenAI Compatible**：
