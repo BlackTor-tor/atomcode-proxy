@@ -65,8 +65,8 @@ _load_dotenv()
 
 
 def _resolve_working_dir() -> str:
-    """默认工作目录：优先取用户主目录，避免 daemon 落在奇怪 cwd。"""
-    return os.environ.get("ATOMCODE_PROXY_WORKDIR") or os.path.expanduser("~")
+    """读取显式工作目录；未选择时返回空值，由启动流程要求用户选择。"""
+    return os.environ.get("ATOMCODE_PROXY_WORKDIR", "").strip()
 
 
 @dataclass

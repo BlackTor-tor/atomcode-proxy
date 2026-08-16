@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import logging
 import os
 import re
@@ -16,12 +17,14 @@ import httpx
 
 from . import __version__
 from .config import Config, _default_env_path
+from .conversation import ConversationKeyResolver
 from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
 from .updater import (
     GITHUB_RELEASES_URL,
     check_for_update,
 )
+from .workdir import choose_working_directory, normalize_working_directory
 
 log = logging.getLogger("atomcode_proxy")
 
@@ -80,10 +83,16 @@ def create_app(config: Config | None = None) -> FastAPI:
     app.include_router(openai_adapter.router)
     app.include_router(anthropic_adapter.router)
     app.state.config = cfg
+    app.state.conversation_resolver = ConversationKeyResolver()
 
     @app.get("/health")
     async def health() -> dict:
-        return {"ok": True, "daemon": cfg.daemon_url, "provider": cfg.default_provider}
+        return {
+            "ok": True,
+            "daemon": cfg.daemon_url,
+            "provider": cfg.default_provider,
+            "working_dir": cfg.working_dir,
+        }
 
     @app.get("/version")
     async def version() -> dict:
@@ -204,6 +213,16 @@ def create_app(config: Config | None = None) -> FastAPI:
             log.warning("获取模型列表失败: %s", e)
             return JSONResponse(status_code=502, content={"error": str(e)})
 
+    @app.post("/api/choose-working-dir")
+    async def api_choose_working_dir(request: Request) -> JSONResponse:
+        """打开本机目录选择器，供设置页切换代理默认工作目录。"""
+        if not _is_local_download_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
+        selected = await asyncio.to_thread(choose_working_directory, cfg.working_dir)
+        if not selected:
+            return JSONResponse({"selected": False, "working_dir": cfg.working_dir})
+        return JSONResponse({"selected": True, "working_dir": selected})
+
     # ── 配置页面辅助函数 ──────────────────────────────────────────
 
     _SETTING_FIELDS = [
@@ -314,7 +333,39 @@ def create_app(config: Config | None = None) -> FastAPI:
         fields_html = ""
         for field_name, label, input_type, options in _SETTING_FIELDS:
             val = _current_value(field_name, env_vals, runtime)
-            if input_type == "select" and options:
+            if field_name == "ATOMCODE_PROXY_WORKDIR":
+                escaped_val = val.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                input_html = f'''
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <input type="text" name="{field_name}" id="working-dir-input" value="{escaped_val}"
+                           placeholder="启动时选择，或输入绝对路径"
+                           style="flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">
+                    <button type="button" class="btn btn-secondary" id="choose-working-dir-btn">选择目录</button>
+                </div>
+                <div id="working-dir-status" style="font-size:12px;color:#666;margin-top:5px;">
+                    当前目录必须存在，且会用于此代理实例创建的 daemon 会话
+                </div>
+                <script>
+                (function() {{
+                    var button = document.getElementById("choose-working-dir-btn");
+                    var input = document.getElementById("working-dir-input");
+                    var status = document.getElementById("working-dir-status");
+                    button.addEventListener("click", function() {{
+                        button.disabled = true;
+                        status.textContent = "请选择目录...";
+                        fetch("/api/choose-working-dir", {{method: "POST"}})
+                            .then(function(r) {{ return r.json(); }})
+                            .then(function(data) {{
+                                if (data.selected) {{ input.value = data.working_dir; status.textContent = "已选择目录"; }}
+                                else {{ status.textContent = "未更改目录"; }}
+                            }})
+                            .catch(function(err) {{ status.textContent = "选择目录失败: " + err.message; }})
+                            .finally(function() {{ button.disabled = false; }});
+                    }});
+                }})();
+                </script>
+                '''
+            elif input_type == "select" and options:
                 opts = "".join(
                     f'<option value="{o}" {"selected" if val == o else ""}>{o}</option>'
                     for o in options
@@ -525,12 +576,22 @@ def create_app(config: Config | None = None) -> FastAPI:
         new_provider = updates.get("ATOMCODE_DEFAULT_PROVIDER", "").strip()
         new_mode = updates.get("ATOMCODE_APPROVAL_MODE", "").strip()
         new_workdir = updates.get("ATOMCODE_PROXY_WORKDIR", "").strip()
+        persist_updates = dict(updates)
         if new_provider:
             cfg.default_provider = new_provider
         if new_mode:
             cfg.approval_mode = new_mode
         if new_workdir:
-            cfg.working_dir = new_workdir
+            normalized_workdir = normalize_working_directory(new_workdir)
+            if normalized_workdir:
+                cfg.working_dir = normalized_workdir
+                persist_updates["ATOMCODE_PROXY_WORKDIR"] = normalized_workdir
+            else:
+                messages.append("工作目录无效：目录不存在或不是目录，本次未修改")
+                persist_updates.pop("ATOMCODE_PROXY_WORKDIR", None)
+        elif "ATOMCODE_PROXY_WORKDIR" in updates:
+            messages.append("工作目录不能为空；请保留现有目录或选择一个新目录")
+            persist_updates.pop("ATOMCODE_PROXY_WORKDIR", None)
 
         # 模型别名：解析 k=v 列表（允许清空）
         aliases: dict[str, str] = {}
@@ -578,7 +639,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         # 可选持久化到 .env
         if save_to_env:
-            env_path = _write_env_file(updates)
+            env_path = _write_env_file(persist_updates)
             messages.append(f"已同步保存到 {env_path}")
         else:
             messages.append("未写入 .env：修改仅当前运行生效，重启后回到 .env/环境变量的值")
