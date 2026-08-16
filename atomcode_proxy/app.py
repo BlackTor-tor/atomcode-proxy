@@ -794,9 +794,6 @@ def create_app(config: Config | None = None) -> FastAPI:
     }})();
     </script>
     <script>
-    // 服务端注入的 GitHub Releases 下载页链接（失败兜底提示用）
-    var RELEASES_URL = "{GITHUB_RELEASES_URL}";
-
     // 通过 ?check_update=1 进入（托盘「检查更新」入口）时自动触发一次检查
     if (location.search.indexOf("check_update") !== -1) {{
         checkForUpdate();
@@ -862,14 +859,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 setTimeout(function() {{ URL.revokeObjectURL(url); }}, 10000);
                 if (btn) {{ btn.style.display = "none"; }}
                 if (status) {{
-                    status.innerHTML = '<span style="color:#155724;">✅ 下载已开始，保存位置由浏览器决定，请查看浏览器下载列表</span>';
+                    status.innerHTML = '<span style="color:#155724;">✅ 下载成功</span>';
                 }}
             }})
             .catch(function(err) {{
                 if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
-                var fallback = err && err.fallback_url ? err.fallback_url : RELEASES_URL;
+                var reason = (err && (err.error || err.message)) || "未知错误";
                 if (status) {{
-                    status.innerHTML = '<span style="color:#dc3545;">❌ 下载失败，请到下载页：<a href="' + fallback + '" target="_blank" style="color:#dc3545;text-decoration:underline;">' + fallback + '</a> 进行下载</span>';
+                    status.innerHTML = '';
+                    var span = document.createElement("span");
+                    span.style.color = "#dc3545";
+                    span.textContent = "❌ 下载失败，原因：" + reason;
+                    status.appendChild(span);
                 }}
             }});
     }}
