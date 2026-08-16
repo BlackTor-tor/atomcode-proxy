@@ -1,8 +1,8 @@
 """适配代理配置：环境变量驱动，全部带默认值。
 
-加载优先级：已存在的环境变量 > 用户配置文件 config.json > .env 文件 > 内置默认值。
+加载优先级：已存在的环境变量 > 用户配置文件 atomcode-proxy-config.json > .env 文件 > 内置默认值。
 程序永不会自动生成/写入 .env（仅 --init-config 手动生成模板）；
-网页设置页保存的配置持久化到用户目录下的 config.json。
+网页设置页保存的配置持久化到用户目录下的 atomcode-proxy-config.json。
 """
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ _load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# 用户配置文件（config.json）：网页设置页保存的持久化存储
+# 用户配置文件（atomcode-proxy-config.json）：网页设置页保存的持久化存储
 # ---------------------------------------------------------------------------
 
 # 允许持久化的配置键（与设置页字段一致）
@@ -87,13 +87,13 @@ _USER_CONFIG_KEYS = (
 
 
 def user_config_path() -> Path:
-    """用户配置文件路径：Windows 取 %APPDATA%\\atomcode-proxy\\config.json，
-    其他平台取 ~/.config/atomcode-proxy/config.json。exe 旁不生成任何文件。"""
+    """用户配置文件路径：Windows 取 %APPDATA%\\atomcode-proxy\\atomcode-proxy-config.json，
+    其他平台取 ~/.config/atomcode-proxy/atomcode-proxy-config.json。exe 旁不生成任何文件。"""
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or str(Path.home())
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "atomcode-proxy" / "config.json"
+    return Path(base) / "atomcode-proxy" / "atomcode-proxy-config.json"
 
 
 def read_user_config() -> dict[str, str]:
@@ -133,7 +133,7 @@ _user_config = read_user_config()
 
 
 def _cfg_value(key: str, default: str) -> str:
-    """取值优先级：系统环境变量 > config.json（网页保存）> 内置默认值。
+    """取值优先级：系统环境变量 > atomcode-proxy-config.json（网页保存）> 内置默认值。
 
     .env 的值在模块加载时已并入 os.environ（不覆盖已有变量），因此环境变量分支已涵盖 .env。
     """
@@ -141,7 +141,7 @@ def _cfg_value(key: str, default: str) -> str:
 
 
 def _resolve_working_dir() -> str:
-    """读取显式工作目录（环境变量 > config.json）；未配置时返回空值，
+    """读取显式工作目录（环境变量 > atomcode-proxy-config.json）；未配置时返回空值，
     由启动流程回退到用户主目录。"""
     raw = os.environ.get("ATOMCODE_PROXY_WORKDIR") or _user_config.get("ATOMCODE_PROXY_WORKDIR", "")
     return raw.strip()

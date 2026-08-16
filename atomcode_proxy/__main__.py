@@ -244,7 +244,7 @@ def _init_config() -> None:
 
 
 def _ensure_working_directory(cfg: Config) -> None:
-    """确认工作目录：已配置（含 config.json 保存值）则校验后使用；
+    """确认工作目录：已配置（含 atomcode-proxy-config.json 保存值）则校验后使用；
     未配置时回退到用户主目录，不弹窗阻塞启动，可在设置页修改。"""
     selected = normalize_working_directory(cfg.working_dir)
     if selected:

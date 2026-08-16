@@ -258,8 +258,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         ("ATOMCODE_MODEL_ALIAS", "模型别名 (k=v,k2=v2)", "text", None),
     ]
 
-    # 内置默认值：系统环境变量、config.json 和 .env 均未覆盖时，设置页回退显示这些值。
-    # 取自 cfg（已合并环境变量 / config.json / .env / 内置默认），避免默认值重复定义。
+    # 内置默认值：系统环境变量、atomcode-proxy-config.json 和 .env 均未覆盖时，设置页回退显示这些值。
+    # 取自 cfg（已合并环境变量 / atomcode-proxy-config.json / .env / 内置默认），避免默认值重复定义。
     _BUILTIN_DEFAULTS: dict[str, str] = {
         "ATOMCODE_PROXY_HOST": cfg.host,
         "ATOMCODE_PROXY_PORT": str(cfg.port),
@@ -272,7 +272,7 @@ def create_app(config: Config | None = None) -> FastAPI:
     }
 
     def _read_env_file() -> dict[str, str]:
-        """读取用户已保存的配置（config.json），返回 {key: value} 字典。"""
+        """读取用户已保存的配置（atomcode-proxy-config.json），返回 {key: value} 字典。"""
         return read_user_config()
 
     def _runtime_values() -> dict[str, str]:
@@ -291,7 +291,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     def _current_value(field_name: str, env_vals: dict[str, str], runtime: dict[str, str]) -> str:
         """获取字段当前值：优先运行时配置（网页热更新值），其次用户配置文件
-        （config.json），再环境变量（含 .env 并入值），最后内置默认值。
+        （atomcode-proxy-config.json），再环境变量（含 .env 并入值），最后内置默认值。
         模型别名允许运行时为空（可清空）。"""
         if field_name in runtime and (runtime[field_name] or field_name == "ATOMCODE_MODEL_ALIAS"):
             return runtime[field_name]
@@ -555,7 +555,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/settings", response_class=HTMLResponse)
     async def settings_save(request: Request) -> Response:
-        """接收表单数据：热更新内存配置并持久化到用户配置文件 config.json。"""
+        """接收表单数据：热更新内存配置并持久化到用户配置文件 atomcode-proxy-config.json。"""
         if not _is_local_source(request, cfg):
             return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         form = await request.form()
@@ -573,7 +573,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         )
 
     async def _apply_settings(app: FastAPI, updates: dict[str, str]) -> list[str]:
-        """把表单修改热更新到运行时配置，并持久化到用户配置文件 config.json。
+        """把表单修改热更新到运行时配置，并持久化到用户配置文件 atomcode-proxy-config.json。
 
         返回提示消息列表。
         """
