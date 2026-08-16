@@ -5,18 +5,17 @@ import base64
 import asyncio
 import logging
 import os
-import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 import httpx
 
 from . import __version__
-from .config import Config, _default_env_path
+from .config import Config, read_user_config, write_user_config
 from .conversation import ConversationKeyResolver
 from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
@@ -215,13 +214,34 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/api/choose-working-dir")
     async def api_choose_working_dir(request: Request) -> JSONResponse:
-        """打开本机目录选择器，供设置页切换代理默认工作目录。"""
+        """打开本机目录选择器，供设置页切换代理默认工作目录。
+
+        请求体可选传 {"current": "..."} 作为选择器初始目录（输入框当前值）。
+        """
         if not _is_local_download_source(request, cfg):
             return JSONResponse(status_code=403, content={"error": "禁止的来源"})
-        selected = await asyncio.to_thread(choose_working_directory, cfg.working_dir)
+        initial = cfg.working_dir
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and body.get("current"):
+                initial = str(body["current"])
+        except Exception:
+            pass  # 无请求体或非 JSON 时使用默认初始目录
+        selected = await asyncio.to_thread(choose_working_directory, initial)
         if not selected:
             return JSONResponse({"selected": False, "working_dir": cfg.working_dir})
         return JSONResponse({"selected": True, "working_dir": selected})
+
+    @app.post("/api/validate-dir")
+    async def api_validate_dir(request: Request) -> JSONResponse:
+        """校验工作目录路径是否存在，供设置页输入框即时反馈。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON"})
+        raw = str(body.get("path", "")) if isinstance(body, dict) else ""
+        normalized = normalize_working_directory(raw)
+        return JSONResponse({"valid": bool(normalized), "normalized": normalized or ""})
 
     # ── 配置页面辅助函数 ──────────────────────────────────────────
 
@@ -236,8 +256,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         ("ATOMCODE_MODEL_ALIAS", "模型别名 (k=v,k2=v2)", "text", None),
     ]
 
-    # 内置默认值：.env 文件和系统环境变量均未覆盖时，设置页回退显示这些值。
-    # 取自 cfg（已合并 .env / 环境变量 / 内置默认），避免默认值重复定义。
+    # 内置默认值：系统环境变量、config.json 和 .env 均未覆盖时，设置页回退显示这些值。
+    # 取自 cfg（已合并环境变量 / config.json / .env / 内置默认），避免默认值重复定义。
     _BUILTIN_DEFAULTS: dict[str, str] = {
         "ATOMCODE_PROXY_HOST": cfg.host,
         "ATOMCODE_PROXY_PORT": str(cfg.port),
@@ -250,50 +270,11 @@ def create_app(config: Config | None = None) -> FastAPI:
     }
 
     def _read_env_file() -> dict[str, str]:
-        """读取 .env 文件，返回 {key: value} 字典（忽略注释行）。"""
-        env_path = _default_env_path()
-        result: dict[str, str] = {}
-        if not env_path.is_file():
-            return result
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            result[key.strip()] = value.strip()
-        return result
-
-    def _write_env_file(updates: dict[str, str]) -> Path:
-        """更新 .env 文件中对应的 KEY=VALUE 行；不存在则创建。"""
-        env_path = _default_env_path()
-        if env_path.is_file():
-            content = env_path.read_text(encoding="utf-8")
-            lines = content.splitlines(keepends=True)
-            new_lines: list[str] = []
-            handled: set[str] = set()
-            for line in lines:
-                stripped = line.strip()
-                # 匹配注释掉的 #KEY=VALUE 或正常 KEY=VALUE
-                m = re.match(r"^#?\s*([A-Z_][A-Z0-9_]*)=(.*)$", stripped)
-                if m and m.group(1) in updates:
-                    key = m.group(1)
-                    val = updates[key]
-                    new_lines.append(f"{key}={val}\n")
-                    handled.add(key)
-                else:
-                    new_lines.append(line if line.endswith("\n") else line + "\n")
-            # 追加未处理的字段
-            for key, val in updates.items():
-                if key not in handled:
-                    new_lines.append(f"{key}={val}\n")
-            env_path.write_text("".join(new_lines), encoding="utf-8")
-        else:
-            parts = [f"{k}={v}\n" for k, v in updates.items()]
-            env_path.write_text("".join(parts), encoding="utf-8")
-        return env_path
+        """读取用户已保存的配置（config.json），返回 {key: value} 字典。"""
+        return read_user_config()
 
     def _runtime_values() -> dict[str, str]:
-        """运行时配置快照（网页热更新后的值，优先于 .env 显示）。"""
+        """运行时配置快照（网页热更新后的值，优先于持久化文件显示）。"""
         c = app.state.config
         return {
             "ATOMCODE_PROXY_HOST": c.host,
@@ -307,8 +288,9 @@ def create_app(config: Config | None = None) -> FastAPI:
         }
 
     def _current_value(field_name: str, env_vals: dict[str, str], runtime: dict[str, str]) -> str:
-        """获取字段当前值：优先运行时配置（网页热更新值），其次 .env 文件，
-        再环境变量，最后内置默认值。模型别名允许运行时为空（可清空）。"""
+        """获取字段当前值：优先运行时配置（网页热更新值），其次用户配置文件
+        （config.json），再环境变量（含 .env 并入值），最后内置默认值。
+        模型别名允许运行时为空（可清空）。"""
         if field_name in runtime and (runtime[field_name] or field_name == "ATOMCODE_MODEL_ALIAS"):
             return runtime[field_name]
         if field_name in env_vals:
@@ -338,28 +320,77 @@ def create_app(config: Config | None = None) -> FastAPI:
                 input_html = f'''
                 <div style="display:flex;gap:8px;align-items:center;">
                     <input type="text" name="{field_name}" id="working-dir-input" value="{escaped_val}"
-                           placeholder="启动时选择，或输入绝对路径"
+                           placeholder="粘贴本机已存在的绝对路径，或点击右侧按钮选择"
                            style="flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">
-                    <button type="button" class="btn btn-secondary" id="choose-working-dir-btn">选择目录</button>
+                    <button type="button" class="btn btn-secondary" id="choose-working-dir-btn">选择目录…</button>
                 </div>
                 <div id="working-dir-status" style="font-size:12px;color:#666;margin-top:5px;">
-                    当前目录必须存在，且会用于此代理实例创建的 daemon 会话
+                    目录必须存在，且会用于此代理实例创建的 daemon 会话
                 </div>
                 <script>
                 (function() {{
                     var button = document.getElementById("choose-working-dir-btn");
                     var input = document.getElementById("working-dir-input");
                     var status = document.getElementById("working-dir-status");
-                    button.addEventListener("click", function() {{
-                        button.disabled = true;
-                        status.textContent = "请选择目录...";
-                        fetch("/api/choose-working-dir", {{method: "POST"}})
+                    var validateTimer = null;
+
+                    function showValidation(path) {{
+                        if (!path) {{
+                            status.textContent = "目录不能为空";
+                            status.style.color = "#dc3545";
+                            return;
+                        }}
+                        fetch("/api/validate-dir", {{
+                            method: "POST",
+                            headers: {{"Content-Type": "application/json"}},
+                            body: JSON.stringify({{ path: path }})
+                        }})
                             .then(function(r) {{ return r.json(); }})
                             .then(function(data) {{
-                                if (data.selected) {{ input.value = data.working_dir; status.textContent = "已选择目录"; }}
-                                else {{ status.textContent = "未更改目录"; }}
+                                if (data.valid) {{
+                                    status.textContent = "✓ 目录有效：" + data.normalized;
+                                    status.style.color = "#28a745";
+                                }} else {{
+                                    status.textContent = "✗ 目录不存在或不是本机绝对路径";
+                                    status.style.color = "#dc3545";
+                                }}
                             }})
-                            .catch(function(err) {{ status.textContent = "选择目录失败: " + err.message; }})
+                            .catch(function() {{
+                                status.textContent = "无法校验目录";
+                                status.style.color = "#dc3545";
+                            }});
+                    }}
+
+                    // 输入停顿 500ms 后即时校验
+                    input.addEventListener("input", function() {{
+                        if (validateTimer) {{ clearTimeout(validateTimer); }}
+                        validateTimer = setTimeout(function() {{ showValidation(input.value.trim()); }}, 500);
+                    }});
+                    if (input.value.trim()) {{ showValidation(input.value.trim()); }}
+
+                    button.addEventListener("click", function() {{
+                        button.disabled = true;
+                        status.textContent = "请在弹出的窗口中选择目录…";
+                        status.style.color = "#666";
+                        fetch("/api/choose-working-dir", {{
+                            method: "POST",
+                            headers: {{"Content-Type": "application/json"}},
+                            body: JSON.stringify({{ current: input.value.trim() }})
+                        }})
+                            .then(function(r) {{ return r.json(); }})
+                            .then(function(data) {{
+                                if (data.selected) {{
+                                    input.value = data.working_dir;
+                                    showValidation(data.working_dir);
+                                }} else {{
+                                    status.textContent = "已取消选择，目录未更改";
+                                    status.style.color = "#666";
+                                }}
+                            }})
+                            .catch(function(err) {{
+                                status.textContent = "选择目录失败: " + err.message;
+                                status.style.color = "#dc3545";
+                            }})
                             .finally(function() {{ button.disabled = false; }});
                     }});
                 }})();
@@ -502,11 +533,8 @@ def create_app(config: Config | None = None) -> FastAPI:
             <h2>服务配置</h2>
             {fields_html}
         </div>
-        <div style="text-align:center; margin: 20px 0;">
-            <label style="display:inline-flex; align-items:center; gap:6px; font-size:14px; color:#555; margin-bottom:14px; cursor:pointer;">
-                <input type="checkbox" name="save_to_env" value="on" style="width:16px;height:16px;">
-                同时保存到 .env 文件（重启后仍生效；不勾选则仅当前运行生效）
-            </label>
+        <div style="text-align:center; margin: 20px 0; font-size:13px;color:#666;">
+            保存后立即生效并写入用户配置文件（重启后仍保留）；监听地址/端口需重启服务才能生效
             <br>
             <button type="submit" class="btn">保存配置</button>
         </div>
@@ -525,35 +553,30 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.post("/settings", response_class=HTMLResponse)
     async def settings_save(request: Request) -> str:
-        """接收表单数据：热更新内存配置，不写 .env 也立即生效。
-
-        监听地址/端口运行时无法变更（服务已绑定），仅当勾选「保存到 .env」
-        时写入供重启后生效。
-        """
+        """接收表单数据：热更新内存配置并持久化到用户配置文件 config.json。"""
         form = await request.form()
         updates: dict[str, str] = {}
         for field_name, _, input_type, _ in _SETTING_FIELDS:
             val = form.get(field_name, "")
             if val is not None:
                 updates[field_name] = str(val)
-        save_to_env = str(form.get("save_to_env", "")).lower() in ("on", "1", "true")
 
-        messages = await _apply_settings(app, updates, save_to_env)
+        messages = await _apply_settings(app, updates)
         return _settings_html(
             _read_env_file(),
             message="<br>".join(messages),
             runtime=_runtime_values(),
         )
 
-    async def _apply_settings(app: FastAPI, updates: dict[str, str], save_to_env: bool) -> list[str]:
-        """把表单修改热更新到运行时配置；save_to_env 为真时同步写 .env。
+    async def _apply_settings(app: FastAPI, updates: dict[str, str]) -> list[str]:
+        """把表单修改热更新到运行时配置，并持久化到用户配置文件 config.json。
 
         返回提示消息列表。
         """
         cfg = app.state.config
         messages: list[str] = []
 
-        # 监听地址/端口：服务已绑定，运行时无法变更；仅勾选持久化时写 .env
+        # 监听地址/端口：服务已绑定，运行时无法变更；保存后重启生效
         host = updates.get("ATOMCODE_PROXY_HOST", "").strip()
         port_raw = updates.get("ATOMCODE_PROXY_PORT", "").strip()
         host_changed = bool(host) and host != cfg.host
@@ -562,15 +585,16 @@ def create_app(config: Config | None = None) -> FastAPI:
             try:
                 if not 1 <= int(port_raw) <= 65535:
                     messages.append("端口无效（1-65535），本次未修改端口")
+                    updates.pop("ATOMCODE_PROXY_PORT", None)
                 else:
                     port_changed = int(port_raw) != cfg.port
             except ValueError:
                 messages.append("端口无效（1-65535），本次未修改端口")
+                updates.pop("ATOMCODE_PROXY_PORT", None)
+        else:
+            updates.pop("ATOMCODE_PROXY_PORT", None)
         if host_changed or port_changed:
-            if save_to_env:
-                messages.append("监听地址/端口已保存到 .env，重启服务后生效")
-            else:
-                messages.append("监听地址/端口需重启生效：请勾选「保存到 .env」后再次保存")
+            messages.append("监听地址/端口已保存，重启服务后生效")
 
         # 默认 Provider / 审批模式 / 工作目录：热更新，立即生效
         new_provider = updates.get("ATOMCODE_DEFAULT_PROVIDER", "").strip()
@@ -637,12 +661,13 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         messages.append("配置已保存并立即生效")
 
-        # 可选持久化到 .env
-        if save_to_env:
-            env_path = _write_env_file(persist_updates)
-            messages.append(f"已同步保存到 {env_path}")
-        else:
-            messages.append("未写入 .env：修改仅当前运行生效，重启后回到 .env/环境变量的值")
+        # 持久化到用户配置文件（exe 旁不生成任何文件）
+        try:
+            cfg_path = write_user_config(persist_updates)
+            messages.append(f"已写入用户配置文件: {cfg_path}")
+        except OSError as exc:
+            log.warning("写入用户配置文件失败: %s", exc)
+            messages.append(f"写入用户配置文件失败（修改仅本次运行生效）: {exc}")
 
         return messages
 
@@ -794,6 +819,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     }})();
     </script>
     <script>
+    // 服务端注入的 GitHub Releases 下载页链接（下载失败时引导用户前往）
+    var RELEASES_URL = "{GITHUB_RELEASES_URL}";
+
     // 通过 ?check_update=1 进入（托盘「检查更新」入口）时自动触发一次检查
     if (location.search.indexOf("check_update") !== -1) {{
         checkForUpdate();
@@ -865,11 +893,20 @@ def create_app(config: Config | None = None) -> FastAPI:
             .catch(function(err) {{
                 if (btn) {{ btn.disabled = false; btn.textContent = "重试下载"; }}
                 var reason = (err && (err.error || err.message)) || "未知错误";
+                var fallback = (err && err.fallback_url) || RELEASES_URL;
                 if (status) {{
                     status.innerHTML = '';
                     var span = document.createElement("span");
                     span.style.color = "#dc3545";
-                    span.textContent = "❌ 下载失败，原因：" + reason;
+                    span.textContent = "❌ 下载失败，请到 ";
+                    var link = document.createElement("a");
+                    link.href = fallback;
+                    link.target = "_blank";
+                    link.style.color = "#dc3545";
+                    link.style.textDecoration = "underline";
+                    link.textContent = fallback;
+                    span.appendChild(link);
+                    span.appendChild(document.createTextNode(" 下载。原因：" + reason));
                     status.appendChild(span);
                 }}
             }});

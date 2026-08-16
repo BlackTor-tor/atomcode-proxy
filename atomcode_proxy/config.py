@@ -1,9 +1,12 @@
 """适配代理配置：环境变量驱动，全部带默认值。
 
-加载优先级：已存在的环境变量 > 项目根目录 .env 文件 > 内置默认值。
+加载优先级：已存在的环境变量 > 用户配置文件 config.json > .env 文件 > 内置默认值。
+程序永不会自动生成/写入 .env（仅 --init-config 手动生成模板）；
+网页设置页保存的配置持久化到用户目录下的 config.json。
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -64,23 +67,96 @@ def _load_dotenv(path: Path | None = None) -> None:
 _load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# 用户配置文件（config.json）：网页设置页保存的持久化存储
+# ---------------------------------------------------------------------------
+
+# 允许持久化的配置键（与设置页字段一致）
+_USER_CONFIG_KEYS = (
+    "ATOMCODE_PROXY_HOST",
+    "ATOMCODE_PROXY_PORT",
+    "ATOMCODE_DAEMON_URL",
+    "ATOMCODE_DAEMON_TOKEN",
+    "ATOMCODE_DEFAULT_PROVIDER",
+    "ATOMCODE_APPROVAL_MODE",
+    "ATOMCODE_PROXY_WORKDIR",
+    "ATOMCODE_MODEL_ALIAS",
+)
+
+
+def user_config_path() -> Path:
+    """用户配置文件路径：Windows 取 %APPDATA%\\atomcode-proxy\\config.json，
+    其他平台取 ~/.config/atomcode-proxy/config.json。exe 旁不生成任何文件。"""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home())
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "atomcode-proxy" / "config.json"
+
+
+def read_user_config() -> dict[str, str]:
+    """读取用户配置文件，返回 {key: value}；文件不存在或损坏时返回空字典。"""
+    path = user_config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.warning("用户配置文件读取失败，忽略: %s (%s)", path, exc)
+        return {}
+    if not isinstance(data, dict):
+        log.warning("用户配置文件格式异常（非对象），忽略: %s", path)
+        return {}
+    return {k: str(v) for k, v in data.items() if k in _USER_CONFIG_KEYS}
+
+
+def write_user_config(updates: dict[str, str]) -> Path:
+    """把 {key: value} 合并写入用户配置文件；空值表示删除该项。返回文件路径。"""
+    merged = read_user_config()
+    for key, val in updates.items():
+        if key not in _USER_CONFIG_KEYS:
+            continue
+        if val:
+            merged[key] = val
+        else:
+            merged.pop(key, None)
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+# 启动时加载一次用户配置（网页保存值），供 Config 解析优先于 .env/默认值
+_user_config = read_user_config()
+
+
+def _cfg_value(key: str, default: str) -> str:
+    """取值优先级：系统环境变量 > config.json（网页保存）> 内置默认值。
+
+    .env 的值在模块加载时已并入 os.environ（不覆盖已有变量），因此环境变量分支已涵盖 .env。
+    """
+    return os.environ.get(key) or _user_config.get(key) or default
+
+
 def _resolve_working_dir() -> str:
-    """读取显式工作目录；未选择时返回空值，由启动流程要求用户选择。"""
-    return os.environ.get("ATOMCODE_PROXY_WORKDIR", "").strip()
+    """读取显式工作目录（环境变量 > config.json）；未配置时返回空值，
+    由启动流程回退到用户主目录。"""
+    raw = os.environ.get("ATOMCODE_PROXY_WORKDIR") or _user_config.get("ATOMCODE_PROXY_WORKDIR", "")
+    return raw.strip()
 
 
 @dataclass
 class Config:
     """运行时可变的配置对象：网页保存的热更新直接改字段即可。"""
-    host: str = field(default_factory=lambda: os.environ.get("ATOMCODE_PROXY_HOST", "127.0.0.1"))
-    port: int = field(default_factory=lambda: int(os.environ.get("ATOMCODE_PROXY_PORT", "8765")))
+    host: str = field(default_factory=lambda: _cfg_value("ATOMCODE_PROXY_HOST", "127.0.0.1"))
+    port: int = field(default_factory=lambda: int(_cfg_value("ATOMCODE_PROXY_PORT", "8765")))
 
-    daemon_url: str = field(default_factory=lambda: os.environ.get("ATOMCODE_DAEMON_URL", "http://127.0.0.1:13456"))
-    daemon_token: str = field(default_factory=lambda: os.environ.get("ATOMCODE_DAEMON_TOKEN", "atomcode_webui"))
+    daemon_url: str = field(default_factory=lambda: _cfg_value("ATOMCODE_DAEMON_URL", "http://127.0.0.1:13456"))
+    daemon_token: str = field(default_factory=lambda: _cfg_value("ATOMCODE_DAEMON_TOKEN", "atomcode_webui"))
     default_provider: str = field(
-        default_factory=lambda: os.environ.get("ATOMCODE_DEFAULT_PROVIDER", "AtomGit-deepseek-v4-flash")
+        default_factory=lambda: _cfg_value("ATOMCODE_DEFAULT_PROVIDER", "AtomGit-deepseek-v4-flash")
     )
-    approval_mode: str = field(default_factory=lambda: os.environ.get("ATOMCODE_APPROVAL_MODE", "bypass"))
+    approval_mode: str = field(default_factory=lambda: _cfg_value("ATOMCODE_APPROVAL_MODE", "bypass"))
     working_dir: str = field(default_factory=_resolve_working_dir)
 
     # OpenAI 模型别名：逗号分隔的 k=v 列表，如 "claude-3-5-sonnet=AtomGit-deepseek-v4-flash"
@@ -89,7 +165,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         aliases: dict[str, str] = {}
-        raw = os.environ.get("ATOMCODE_MODEL_ALIAS", "")
+        raw = os.environ.get("ATOMCODE_MODEL_ALIAS") or _user_config.get("ATOMCODE_MODEL_ALIAS", "")
         for pair in raw.split(","):
             if "=" in pair:
                 k, v = pair.split("=", 1)

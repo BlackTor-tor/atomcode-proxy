@@ -29,15 +29,15 @@ flowchart LR
 
 1. 从最新 Release 下载 `atomcode-proxy-<版本>-windows-x64.exe`。
 2. **双击运行**即可——程序会自动启动 AtomCode daemon（如果未运行）并启动代理服务。
-3. 首次启动会弹出目录选择器；选择的目录就是 daemon 的工作目录，并会保存到 exe 旁的 `.env`。默认监听 `127.0.0.1:8765`。
+3. 首次启动默认使用用户主目录作为 daemon 工作目录（可在设置页修改，支持弹窗选择或粘贴路径即时校验）。默认监听 `127.0.0.1:8765`，exe 旁不会生成任何配置文件。
 4. 程序自动打开浏览器显示状态页面，系统托盘图标提供以下功能：
    - **打开状态页面**：查看服务状态、daemon 连接信息、客户端接入指南
-   - **打开设置页面**：在浏览器中修改端口、provider 等配置并保存到 `.env`，重启 exe 生效
+   - **打开设置页面**：在浏览器中修改端口、provider、工作目录等配置，保存后立即生效并持久化到用户目录的 `config.json`（监听地址/端口需重启生效）
    - **显示日志**：用默认程序打开运行日志文件
    - **退出**：停止所有服务并关闭程序
 5. 点击托盘“退出”即完全关闭（exe 退出时会自动关闭它启动的 daemon）。
 
-> 💡 高级用户可在 exe 旁创建 `.env` 文件自定义配置（端口、provider 等），运行 `atomcode-proxy.exe --init-config` 可生成配置模板。
+> 💡 程序不会自动生成任何配置文件：设置页保存的配置存放在用户目录（`%APPDATA%\atomcode-proxy\config.json`）。高级用户也可在 exe 旁创建 `.env` 文件自定义配置（存在才会读取，程序不会写入它），运行 `atomcode-proxy.exe --init-config` 可生成模板。
 >
 > 📝 日志文件保存在 `logs/atomcode-proxy.log`（exe 同级目录），可通过托盘菜单直接查看。
 
@@ -50,7 +50,7 @@ flowchart LR
 | `ATOMCODE_DAEMON_TOKEN` | `atomcode_webui` | daemon 认证 token |
 | `ATOMCODE_DEFAULT_PROVIDER` | `AtomGit-deepseek-v4-flash` | 默认模型 provider |
 | `ATOMCODE_APPROVAL_MODE` | `bypass` | 审批模式 |
-| `ATOMCODE_PROXY_WORKDIR` | 启动时选择 | daemon 工作目录；也可由请求按客户端覆盖 |
+| `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 工作目录；可在设置页修改，也可由请求按客户端覆盖 |
 | `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名 |
 
 > ⚠️ Windows Defender / 杀毒软件可能对 PyInstaller 打包的单文件程序误报（未经数字签名的可执行文件常见现象）。如遇拦截，请添加信任或允许运行，也可按下文自行从源码构建。
@@ -98,10 +98,12 @@ python run.py
 
 ## 配置
 
-除工作目录需要在首次启动时确认外，其余配置均有内置默认值，**无需 `.env` 文件即可运行**。
+所有配置均有内置默认值，**无需任何配置文件即可运行**；首次启动默认使用用户主目录作为工作目录。
 
-如需自定义，可在 exe 旁（开发模式为项目根目录）创建 `.env` 文件，运行 `--init-config` 可生成模板。
-优先级：**已存在的系统环境变量 > `.env` 文件 > 内置默认值**。
+日常推荐通过**设置页面**修改配置：保存后立即生效，并持久化到用户目录的 `config.json`（Windows：`%APPDATA%\atomcode-proxy\config.json`），重启后仍保留。程序永远不会在 exe 旁生成或写入配置文件。
+
+高级用法：在 exe 旁（开发模式为项目根目录）创建 `.env` 文件（运行 `--init-config` 可生成模板，存在才会被读取，程序不会自动生成或写入）。
+优先级：**已存在的系统环境变量 > `config.json`（设置页保存）> `.env` 文件 > 内置默认值**。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -111,7 +113,7 @@ python run.py
 | `ATOMCODE_DAEMON_TOKEN` | `atomcode_webui` | daemon 认证 token |
 | `ATOMCODE_DEFAULT_PROVIDER` | `AtomGit-deepseek-v4-flash` | 默认模型 provider |
 | `ATOMCODE_APPROVAL_MODE` | `bypass` | 审批模式：`bypass`/`build`/`plan`/`accept_edits` |
-| `ATOMCODE_PROXY_WORKDIR` | 启动时选择 | daemon 默认工作目录；请求可用 header、body 或 URL 参数覆盖 |
+| `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 默认工作目录；可在设置页修改，请求可用 header、body 或 URL 参数覆盖 |
 | `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名，逗号分隔 `k=v`，如 `gpt-4o=AtomGit-deepseek-v4-flash` |
 
 `.env` 加载在 `config.py` 模块导入时完成，无需额外依赖（自带轻量解析，仅支持 `KEY=VALUE`、`#` 注释、引号包裹值）。
@@ -222,7 +224,7 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 1. 请求显式目录：`X-AtomCode-Working-Directory`（也接受 `X-Working-Directory`、`X-Workspace-Directory`、`X-Cursor-Workspace-Path`）。
 2. 请求 JSON 的 `working_dir` / `cwd` / `workspace_path`，或 `metadata` 中的同名字段。
 3. Base URL 查询参数 `?working_dir=F:/Projects/example`。
-4. 代理启动时的目录选择；该选择会保存到 exe 旁的 `.env`，作为没有请求级目录的客户端默认值。
+4. 代理默认工作目录（未配置时回退到用户主目录）；该值可在设置页修改并保存到用户目录的 `config.json`，作为没有请求级目录的客户端默认值。
 
 请求级目录必须是本机已存在的绝对目录。每个客户端身份、工作目录和会话 ID 都会绑定独立 daemon session；如果客户端没有提供稳定会话 ID，代理会根据完整消息历史前缀识别连续回合，不会把两个新对话共用一个 session。
 

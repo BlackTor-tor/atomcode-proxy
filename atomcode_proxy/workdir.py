@@ -37,7 +37,10 @@ def choose_working_directory(initial_dir: str | None = None) -> str | None:
         return None
     root.withdraw()
     try:
+        # 确保选择器置顶且获得焦点，避免被浏览器窗口遮挡
         root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
         selected = filedialog.askdirectory(
             parent=root,
             initialdir=initial,

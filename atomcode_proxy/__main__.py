@@ -18,7 +18,7 @@ from . import __version__
 from .app import create_app
 from .config import Config, DEFAULT_ENV_TEMPLATE, _default_env_path
 from .tray import SystemTray
-from .workdir import choose_working_directory, normalize_working_directory
+from .workdir import normalize_working_directory
 
 log = logging.getLogger("atomcode_proxy.main")
 
@@ -243,44 +243,15 @@ def _init_config() -> None:
     print("如需自定义，取消注释对应行并修改值即可。")
 
 
-def _persist_working_directory(path: str) -> None:
-    """将启动时选择的目录写入 .env，供下次启动复用。"""
-    env_path = _default_env_path()
-    content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    lines = content.splitlines(keepends=True)
-    output: list[str] = []
-    handled = False
-    for line in lines:
-        if line.strip().startswith("#ATOMCODE_PROXY_WORKDIR=") or line.strip().startswith("ATOMCODE_PROXY_WORKDIR="):
-            output.append(f"ATOMCODE_PROXY_WORKDIR={path}\n")
-            handled = True
-        else:
-            output.append(line if line.endswith("\n") else line + "\n")
-    if not handled:
-        output.append(f"ATOMCODE_PROXY_WORKDIR={path}\n")
-    env_path.write_text("".join(output), encoding="utf-8")
-    log.info("已保存工作目录到 %s: %s", env_path, path)
-
-
-def _ensure_working_directory(cfg: Config) -> bool:
-    """启动前确认工作目录，未配置时打开原生目录选择器。"""
+def _ensure_working_directory(cfg: Config) -> None:
+    """确认工作目录：已配置（含 config.json 保存值）则校验后使用；
+    未配置时回退到用户主目录，不弹窗阻塞启动，可在设置页修改。"""
     selected = normalize_working_directory(cfg.working_dir)
     if selected:
         cfg.working_dir = selected
-        return True
-
-    selected = choose_working_directory(cfg.working_dir)
-    if not selected:
-        log.error("未选择工作目录，代理不会启动")
-        print("[错误] 必须选择一个存在的工作目录后才能启动代理。")
-        return False
-    cfg.working_dir = selected
-    os.environ["ATOMCODE_PROXY_WORKDIR"] = selected
-    try:
-        _persist_working_directory(selected)
-    except OSError as exc:
-        log.warning("保存工作目录失败，将仅用于本次运行: %s", exc)
-    return True
+        return
+    cfg.working_dir = str(Path.home())
+    log.info("未配置工作目录，默认使用用户主目录: %s（可在设置页修改）", cfg.working_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +266,7 @@ def main() -> None:
 
     cfg = Config.from_env()
 
-    if not _ensure_working_directory(cfg):
-        return
+    _ensure_working_directory(cfg)
 
     # --- 配置日志 ---
     log_path = _setup_logging(cfg)
@@ -306,7 +276,7 @@ def main() -> None:
     if not _check_port_available(cfg.host, cfg.port):
         log.error("端口 %s 已被占用，无法启动", cfg.port)
         print(f"[错误] 端口 {cfg.port} 已被占用，无法启动。")
-        print("可在 .env 中设置 ATOMCODE_PROXY_PORT 更换端口。")
+        print("可在设置页面（或系统环境变量）更换监听端口后重启。")
         if not getattr(sys, "frozen", False):
             input("按回车键退出...")
         sys.exit(1)
