@@ -22,7 +22,7 @@ VERSION = _match.group(1) if _match else "0.0.0"
 hiddenimports = collect_submodules("uvicorn")
 
 # 可选依赖：环境未装则跳过（容错）
-for _mod in ("websockets", "httptools", "watchfiles", "pystray", "PIL", "multipart"):
+for _mod in ("websockets", "httptools", "watchfiles", "pystray", "PIL", "multipart", "tkinter", "tkinter.filedialog"):
     try:
         __import__(_mod)
         hiddenimports.append(_mod)

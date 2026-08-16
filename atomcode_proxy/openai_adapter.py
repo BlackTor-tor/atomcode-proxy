@@ -14,6 +14,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .daemon import AtomCodeDaemon, AtomCodeDaemonError
+from .conversation import (
+    client_scope,
+    explicit_conversation_id,
+    request_working_directory,
+    split_prompt_messages,
+)
 from .sse import HEARTBEAT, with_heartbeat
 
 log = logging.getLogger("atomcode_proxy.openai")
@@ -25,14 +31,12 @@ _TEXT_CHUNK_SIZE = 8
 
 
 def _client_key(request: Request) -> str:
-    """按客户端身份隔离 daemon session 池：auth + user-agent。
+    """按客户端身份生成稳定隔离范围：auth + user-agent。
 
     不同客户端（Cursor / Codex / Claude Code）即使共用同一 working_dir
     也各自持有独立上下文，避免多客户端同时跑任务时串记忆。
     """
-    auth = request.headers.get("authorization", "")
-    ua = request.headers.get("user-agent", "")
-    return f"{auth}|{ua}"
+    return client_scope(request.headers, "openai")
 
 
 def _gen_id() -> str:
@@ -44,23 +48,8 @@ def _now() -> int:
 
 
 def _extract_user_message(messages: list[dict[str, Any]]) -> str:
-    """从 OpenAI messages 中取要发给 daemon 的消息。
-
-    会话历史由 daemon 侧 session 记忆，这里只取最后一条 user 消息；
-    tool 调用结果合并进 user 消息，避免丢失工具输出。
-    """
-    for msg in reversed(messages):
-        role = msg.get("role")
-        if role == "user":
-            content = msg.get("content")
-            if isinstance(content, list):
-                # 多段 content（text/image）：只取文本段
-                parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
-                return "\n".join(parts) or ""
-            return content or ""
-        if role == "tool":
-            return f"[工具结果] {msg.get('content', '')}"
-    return ""
+    """从 OpenAI messages 中取当前 prompt；历史由 session 恢复逻辑单独处理。"""
+    return split_prompt_messages(messages)[0]
 
 
 def _map_stop_reason(stop_reason: str | None) -> str:
@@ -77,13 +66,20 @@ async def _chat_to_openai_events(
     chat_id: str,
     created: int,
     client_key: str,
+    conversation_key: str,
+    history: list[dict[str, Any]],
 ) -> AsyncIterator[str]:
     """把 daemon SSE 流转为 OpenAI SSE 文本行。"""
     # 首块：声明 assistant 角色
     yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
     events = daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider, client_key=client_key
+        message,
+        working_dir=working_dir,
+        provider=provider,
+        client_key=client_key,
+        conversation_key=conversation_key,
+        history=history,
     )
     async for ev in with_heartbeat(events):
         if ev is HEARTBEAT:
@@ -114,6 +110,8 @@ async def _chat_to_openai_object(
     provider: str,
     model_reported: str,
     client_key: str,
+    conversation_key: str,
+    history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """非流式：聚合 daemon 输出为完整 OpenAI 响应。"""
     text_parts: list[str] = []
@@ -121,7 +119,12 @@ async def _chat_to_openai_object(
     stop_reason = "stopped"
     prompt_tokens = completion_tokens = 0
     async for ev in daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider, client_key=client_key
+        message,
+        working_dir=working_dir,
+        provider=provider,
+        client_key=client_key,
+        conversation_key=conversation_key,
+        history=history,
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -171,13 +174,31 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
     client_key = _client_key(request)
+    prompt, history = split_prompt_messages(messages)
+    working_dir, working_dir_source = request_working_directory(
+        request.headers,
+        body,
+        cfg.working_dir,
+        request.query_params,
+    )
+    if not working_dir:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "working directory is not configured or does not exist", "type": "invalid_request_error"}},
+        )
+    resolver = request.app.state.conversation_resolver
+    scope = client_scope(request.headers, provider)
+    conversation_key = resolver.resolve(scope, history, explicit_conversation_id(request.headers, body))
+    resolver.remember(scope, conversation_key, messages)
+    log.info("openai request scope=%s conversation=%s working_dir=%s source=%s", scope, conversation_key, working_dir, working_dir_source)
 
     model_reported = model_raw or provider
     if stream:
         gen = _chat_to_openai_events(
-            daemon, message, working_dir=cfg.working_dir,
+            daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported,
             chat_id=_gen_id(), created=_now(), client_key=client_key,
+            conversation_key=conversation_key, history=history,
         )
         return StreamingResponse(
             gen,
@@ -186,8 +207,9 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         )
     try:
         obj = await _chat_to_openai_object(
-            daemon, message, working_dir=cfg.working_dir, provider=provider,
+            daemon, prompt, working_dir=working_dir, provider=provider,
             model_reported=model_reported, client_key=client_key,
+            conversation_key=conversation_key, history=history,
         )
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:

@@ -7,7 +7,14 @@ __pycache__/
 .venv/
 venv/
 
+# agent
+.qoder
+
+# log
+logs
+
 # 打包产物
 build/
 dist/
 release/
+tests

@@ -15,6 +15,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .daemon import AtomCodeDaemon, AtomCodeDaemonError
+from .conversation import (
+    client_scope,
+    explicit_conversation_id,
+    request_working_directory,
+    split_prompt_messages,
+)
 from .sse import HEARTBEAT, with_heartbeat
 
 log = logging.getLogger("atomcode_proxy.anthropic")
@@ -25,14 +31,12 @@ _TEXT_CHUNK_SIZE = 8
 
 
 def _client_key(request: Request) -> str:
-    """按客户端身份隔离 daemon session 池：auth + user-agent。
+    """按客户端身份生成稳定隔离范围：auth + user-agent。
 
     不同客户端（Cursor / Codex / Claude Code）即使共用同一 working_dir
     也各自持有独立上下文，避免多客户端同时跑任务时串记忆。
     """
-    auth = request.headers.get("authorization", "")
-    ua = request.headers.get("user-agent", "")
-    return f"{auth}|{ua}"
+    return client_scope(request.headers, "anthropic")
 
 
 def _gen_msg_id() -> str:
@@ -41,20 +45,16 @@ def _gen_msg_id() -> str:
 
 def _extract_user_text(messages: list[dict[str, Any]]) -> str:
     """Anthropic content 可能是字符串或 block 数组，取最后一条 user 消息的文本。"""
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") in ("text",):
-                    parts.append(block.get("text", ""))
-            if parts:
-                return "\n".join(parts)
-    return ""
+    return split_prompt_messages(messages)[0]
+
+
+def _messages_with_system(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Anthropic 将 system 放在顶层，恢复 session 时转换为标准 system 消息。"""
+    messages = list(body.get("messages", []))
+    system = body.get("system")
+    if system:
+        messages.insert(0, {"role": "system", "content": system})
+    return messages
 
 
 def _map_stop_reason(stop_reason: str | None) -> str:
@@ -76,6 +76,8 @@ async def _messages_to_anthropic_events(
     model_reported: str,
     msg_id: str,
     client_key: str,
+    conversation_key: str,
+    history: list[dict[str, Any]],
 ) -> AsyncIterator[str]:
     message_obj = {
         "id": msg_id,
@@ -95,7 +97,12 @@ async def _messages_to_anthropic_events(
 
     output_tokens = 0
     events = daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider, client_key=client_key
+        message,
+        working_dir=working_dir,
+        provider=provider,
+        client_key=client_key,
+        conversation_key=conversation_key,
+        history=history,
     )
     async for ev in with_heartbeat(events):
         if ev is HEARTBEAT:
@@ -141,12 +148,19 @@ async def _messages_to_anthropic_object(
     provider: str,
     model_reported: str,
     client_key: str,
+    conversation_key: str,
+    history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     text_parts: list[str] = []
     stop_reason = "stopped"
     input_tokens = output_tokens = 0
     async for ev in daemon.chat_with_session(
-        message, working_dir=working_dir, provider=provider, client_key=client_key
+        message,
+        working_dir=working_dir,
+        provider=provider,
+        client_key=client_key,
+        conversation_key=conversation_key,
+        history=history,
     ):
         etype = ev.get("type")
         if etype == "text":
@@ -174,7 +188,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     model_raw = body.get("model")
     provider = request.app.state.config.resolve_provider(model_raw)
     stream = bool(body.get("stream", False))
-    msgs = body.get("messages", [])
+    msgs = _messages_with_system(body)
     message = _extract_user_text(msgs)
     if not message:
         return JSONResponse(
@@ -186,12 +200,36 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     cfg = request.app.state.config
     client_key = _client_key(request)
 
+    prompt, history = split_prompt_messages(msgs)
+    working_dir, working_dir_source = request_working_directory(
+        request.headers,
+        body,
+        cfg.working_dir,
+        request.query_params,
+    )
+    if not working_dir:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "working directory is not configured or does not exist",
+                },
+            },
+        )
+    resolver = request.app.state.conversation_resolver
+    scope = client_scope(request.headers, provider)
+    conversation_key = resolver.resolve(scope, history, explicit_conversation_id(request.headers, body))
+    resolver.remember(scope, conversation_key, msgs)
+    log.info("anthropic request scope=%s conversation=%s working_dir=%s source=%s", scope, conversation_key, working_dir, working_dir_source)
+
     model_reported = model_raw or provider
     if stream:
         gen = _messages_to_anthropic_events(
-            daemon, message, working_dir=cfg.working_dir,
+            daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported, msg_id=_gen_msg_id(),
-            client_key=client_key,
+            client_key=client_key, conversation_key=conversation_key, history=history,
         )
         return StreamingResponse(
             gen,
@@ -200,8 +238,9 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
         )
     try:
         obj = await _messages_to_anthropic_object(
-            daemon, message, working_dir=cfg.working_dir,
+            daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported, client_key=client_key,
+            conversation_key=conversation_key, history=history,
         )
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:

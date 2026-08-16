@@ -1,7 +1,7 @@
 """AtomCode 本地 daemon 的 HTTP 客户端与 SSE 事件解析。
 
 职责：
-- 管理 AtomCode session 池（并发请求隔离，避免 409 session_busy）
+- 按上游逻辑会话维护 AtomCode session，并在取消时停止 daemon 任务
 - 把 /chat 的 SSE 字节流解析为结构化事件 dict
 - 对外暴露 async 接口，供 OpenAI/Anthropic 适配器调用
 """
@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import uuid
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
 
 import httpx
@@ -22,13 +23,8 @@ BASE_HEADERS_DEFAULT = {
     "X-AtomCode-Client": "webui",
 }
 
-# 每个 (working_dir, client_key) 的 session 池上限，超出淘汰最旧的
-MAX_POOL_SIZE = 8
-
-# 409 session_busy 时优先等待原 session 释放（保住上下文），
-# 每隔 BUSY_RETRY_INTERVAL 秒重试同一 session，超过 BUSY_WAIT_TIMEOUT 才丢弃换新。
-BUSY_RETRY_INTERVAL = 5.0
-BUSY_WAIT_TIMEOUT = 60.0
+# 代理只为每个逻辑会话保留一个 daemon session，避免并发请求被分配到无历史的新 session。
+MAX_CONVERSATIONS = 256
 
 
 class AtomCodeDaemonError(RuntimeError):
@@ -45,51 +41,14 @@ class SessionBusyError(AtomCodeDaemonError):
         self.session_id = session_id
 
 
-class SessionPool:
-    """按 working_dir 维护多个 session，并发请求各拿一个空闲 session。
+@dataclass
+class ConversationState:
+    """一个上游逻辑会话对应的 daemon session 和串行锁。"""
 
-    串行请求复用同一 session（保住上下文），并发请求自动分到不同 session
-    （避免 daemon 侧 409 session_busy）。
-    """
-
-    def __init__(self, daemon: "AtomCodeDaemon") -> None:
-        self._daemon = daemon
-        self._lock = asyncio.Lock()
-        self._pools: dict[tuple[str, str], list[str]] = {}  # (working_dir, client_key) -> [session_id...]
-        self._busy: set[str] = set()                        # 正在被使用的 session_id
-
-    async def acquire(self, working_dir: str, client_key: str | None = None) -> str:
-        """返回一个空闲 session；全忙或池空则新建。
-
-        session 池按 (working_dir, client_key) 隔离：不同客户端（Cursor/Codex/
-        Claude Code）即使共用同一 working_dir 也各自拥有独立上下文，互不串扰。
-        """
-        key = (working_dir, client_key or "")
-        async with self._lock:
-            pool = self._pools.setdefault(key, [])
-            for sid in pool:
-                if sid not in self._busy:
-                    self._busy.add(sid)
-                    return sid
-            sid = await self._daemon._create_session(working_dir)
-            pool.append(sid)
-            if len(pool) > MAX_POOL_SIZE:
-                stale = pool.pop(0)
-                self._busy.discard(stale)
-            self._busy.add(sid)
-            return sid
-
-    def release(self, session_id: str) -> None:
-        self._busy.discard(session_id)
-
-    async def discard(self, working_dir: str, session_id: str, client_key: str | None = None) -> None:
-        """把坏 session（busy 卡死等）移出池，下次请求不再复用。"""
-        key = (working_dir, client_key or "")
-        async with self._lock:
-            pool = self._pools.get(key, [])
-            if session_id in pool:
-                pool.remove(session_id)
-            self._busy.discard(session_id)
+    conversation_key: str
+    working_dir: str
+    session_id: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class AtomCodeDaemon:
@@ -118,9 +77,15 @@ class AtomCodeDaemon:
             headers=self._headers,
             timeout=httpx.Timeout(timeout, connect=10.0),
         )
-        self._pool = SessionPool(self)
+        self._states: dict[str, ConversationState] = {}
+        self._states_lock = asyncio.Lock()
 
     async def close(self) -> None:
+        states = list(self._states.values())
+        await asyncio.gather(
+            *(self._stop_chat_shielded(state.session_id) for state in states if state.session_id),
+            return_exceptions=True,
+        )
         await self._client.aclose()
 
     async def _create_session(self, working_dir: str) -> str:
@@ -132,6 +97,74 @@ class AtomCodeDaemon:
         if not sid:
             raise AtomCodeDaemonError(f"create session: no session_id in {data!r}")
         return sid
+
+    async def _import_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
+        if not messages:
+            return
+        resp = await self._client.post(
+            f"/sessions/{session_id}/messages",
+            json={"messages": messages},
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            raise AtomCodeDaemonError(
+                f"import session messages failed: {resp.status_code} {resp.text[:300]}",
+                resp.status_code,
+            )
+
+    async def stop_chat(self, session_id: str) -> None:
+        """通知 AtomCode 停止指定 session 的 agent 任务；接口本身是幂等的。"""
+        try:
+            resp = await asyncio.wait_for(
+                self._client.post("/chat/stop", json={"session_id": session_id}),
+                timeout=5.0,
+            )
+        except Exception as exc:
+            log.warning("stop daemon chat failed for session %s: %s", session_id, exc)
+            return
+        if resp.status_code not in (200, 201, 202, 204, 404, 409):
+            log.warning("stop daemon chat returned %s for session %s", resp.status_code, session_id)
+
+    async def _stop_chat_shielded(self, session_id: str) -> None:
+        """取消路径中保护 stop 请求，避免上游取消传播把清理请求一并取消。"""
+        task = asyncio.create_task(self.stop_chat(session_id))
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 当前任务已被取消时，继续等待独立 stop task 完成。
+            await task
+
+    async def _state_for(self, conversation_key: str, working_dir: str) -> ConversationState:
+        old_session_id: str | None = None
+        async with self._states_lock:
+            state = self._states.get(conversation_key)
+            if state is None or state.working_dir != working_dir:
+                if state is not None:
+                    old_session_id = state.session_id
+                state = ConversationState(conversation_key, working_dir)
+                self._states[conversation_key] = state
+                if len(self._states) > MAX_CONVERSATIONS:
+                    candidates = [
+                        (key, value)
+                        for key, value in self._states.items()
+                        if key != conversation_key and not value.lock.locked()
+                    ]
+                    if candidates:
+                        self._states.pop(candidates[0][0], None)
+        if old_session_id:
+            await self._stop_chat_shielded(old_session_id)
+        return state
+
+    async def _ensure_session(self, state: ConversationState, history: list[dict[str, Any]]) -> str:
+        if state.session_id:
+            return state.session_id
+        session_id = await self._create_session(state.working_dir)
+        try:
+            await self._import_messages(session_id, history)
+        except Exception:
+            await self._stop_chat_shielded(session_id)
+            raise
+        state.session_id = session_id
+        return session_id
 
     # ---------- 模型列表 ----------
 
@@ -148,51 +181,62 @@ class AtomCodeDaemon:
         message: str,
         *,
         working_dir: str | None = None,
+        conversation_key: str | None = None,
+        history: list[dict[str, Any]] | None = None,
         client_key: str | None = None,
         provider: str | None = None,
         approval_mode: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """从池中取一个空闲 session 发消息，yield daemon 的 SSE 事件。
-
-        并发请求自动分到不同 session；遇到 409 session_busy 时**优先等待原
-        session 释放后重试同一 session**（保住上下文），按 BUSY_RETRY_INTERVAL
-        轮询直到 BUSY_WAIT_TIMEOUT；仍 busy 才丢弃并换新 session 兜底，
-        避免"换新 session 丢记忆"导致任务接不上。
-        """
+        """在一个逻辑会话内串行执行，并在取消时立即通知 daemon 停止。"""
         wd = working_dir or self.default_working_dir
-        session_id = await self._pool.acquire(wd, client_key)
-        # 409 等待窗口截止时间：首次 acquire 后重置，超时后丢弃换新
-        deadline = asyncio.get_running_loop().time() + BUSY_WAIT_TIMEOUT
-        try:
-            while True:
-                try:
-                    async for ev in self._chat_stream_raw(
-                        message,
-                        session_id=session_id,
-                        working_dir=wd,
-                        provider=provider,
-                        approval_mode=approval_mode,
-                    ):
-                        yield ev
-                    return
-                except SessionBusyError:
-                    if asyncio.get_running_loop().time() >= deadline:
-                        # 等待超时：丢弃坏 session 换新的兜底（新 session 重置等待窗口）
-                        log.warning(
-                            "session %s busy > %.0fs, discarding and retrying with fresh session",
-                            session_id, BUSY_WAIT_TIMEOUT,
-                        )
-                        await self._pool.discard(wd, session_id, client_key)
-                        session_id = await self._pool.acquire(wd, client_key)
-                        deadline = asyncio.get_running_loop().time() + BUSY_WAIT_TIMEOUT
-                        continue
-                    log.warning(
-                        "session busy (%s), waiting %.0fs before retry (keep context)",
-                        session_id, BUSY_RETRY_INTERVAL,
-                    )
-                    await asyncio.sleep(BUSY_RETRY_INTERVAL)
-        finally:
-            self._pool.release(session_id)
+        if not wd:
+            raise AtomCodeDaemonError("working directory is not configured")
+        key = conversation_key or f"legacy:{client_key or 'default'}"
+        state = await self._state_for(key, wd)
+
+        # 新回合到达时先终止同一逻辑会话的旧回合，避免 daemon 端 409 busy。
+        if state.lock.locked() and state.session_id:
+            await self._stop_chat_shielded(state.session_id)
+
+        async with state.lock:
+            session_id = await self._ensure_session(state, history or [])
+            retried = False
+            try:
+                while True:
+                    terminal_seen = False
+                    try:
+                        async for ev in self._chat_stream_raw(
+                            message,
+                            session_id=session_id,
+                            working_dir=wd,
+                            provider=provider,
+                            approval_mode=approval_mode,
+                        ):
+                            if ev.get("type") in {"done", "stopped", "error"}:
+                                terminal_seen = True
+                            yield ev
+                        if not terminal_seen:
+                            await self._stop_chat_shielded(session_id)
+                        return
+                    except SessionBusyError:
+                        if retried:
+                            await self._stop_chat_shielded(session_id)
+                            state.session_id = None
+                            raise
+                        retried = True
+                        await self._stop_chat_shielded(session_id)
+                        state.session_id = None
+                        session_id = await self._ensure_session(state, history or [])
+                    except AtomCodeDaemonError as exc:
+                        if exc.status_code not in (404, 410) or retried:
+                            raise
+                        retried = True
+                        await self._stop_chat_shielded(session_id)
+                        state.session_id = None
+                        session_id = await self._ensure_session(state, history or [])
+            except asyncio.CancelledError:
+                await self._stop_chat_shielded(session_id)
+                raise
 
     async def _chat_stream_raw(
         self,
@@ -204,14 +248,16 @@ class AtomCodeDaemon:
         approval_mode: str | None,
     ) -> AsyncIterator[dict[str, Any]]:
         """底层 /chat 调用：不做 session 管理，仅解析 SSE。"""
+        request_id = str(uuid.uuid4())
         body = {
             "message": message,
             "session_id": session_id,
-            "request_id": str(uuid.uuid4()),
+            "request_id": request_id,
             "working_dir": working_dir or self.default_working_dir,
             "provider": provider or self.default_provider,
             "approval_mode": approval_mode or self.approval_mode,
         }
+        log.info("daemon chat start session=%s request=%s working_dir=%s", session_id, request_id, working_dir)
         async with self._client.stream("POST", "/chat", json=body) as resp:
             if resp.status_code == 409:
                 raise SessionBusyError(session_id)
@@ -230,3 +276,4 @@ class AtomCodeDaemon:
                     yield json.loads(payload)
                 except json.JSONDecodeError:
                     log.warning("skip non-json sse payload: %r", payload[:200])
+        log.info("daemon chat stream ended session=%s request=%s", session_id, request_id)
