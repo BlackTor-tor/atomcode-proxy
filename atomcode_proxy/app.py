@@ -40,11 +40,11 @@ def _get_logo_base64() -> str:
     return ""
 
 
-def _is_local_download_source(request: Request, cfg: Config) -> bool:
-    """校验下载请求来源是否为本服务页面（防跨站写盘）。
+def _is_local_source(request: Request, cfg: Config) -> bool:
+    """校验请求来源是否为本服务页面（防恶意网页/局域网主机跨站调用写操作）。
 
-    恶意网页/局域网主机发起的请求会携带其自身的 Origin/Referer，
-    与本服务地址不匹配即拒绝；无来源头的直连请求（如 curl）放行。
+    恶意网页发起的跨站请求会携带其自身的 Origin/Referer，
+    与本服务地址不匹配即拒绝；无来源头的直连请求（如 curl、IDE 客户端）放行。
     """
     allowed = {
         f"http://{cfg.host}:{cfg.port}",
@@ -119,7 +119,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         仅接受来自本服务页面的 POST 请求，防止恶意网页/局域网主机
         通过跨站请求触发下载。
         """
-        if not _is_local_download_source(request, cfg):
+        if not _is_local_source(request, cfg):
             log.warning("拒绝来自非本服务来源的下载请求")
             return JSONResponse(status_code=403, content={"error": "禁止的来源"})
 
@@ -218,7 +218,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         请求体可选传 {"current": "..."} 作为选择器初始目录（输入框当前值）。
         """
-        if not _is_local_download_source(request, cfg):
+        if not _is_local_source(request, cfg):
             return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         initial = cfg.working_dir
         try:
@@ -235,6 +235,8 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/api/validate-dir")
     async def api_validate_dir(request: Request) -> JSONResponse:
         """校验工作目录路径是否存在，供设置页输入框即时反馈。"""
+        if not _is_local_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         try:
             body = await request.json()
         except Exception:
@@ -552,8 +554,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         return _settings_html(env_vals, runtime=_runtime_values())
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(request: Request) -> str:
+    async def settings_save(request: Request) -> Response:
         """接收表单数据：热更新内存配置并持久化到用户配置文件 config.json。"""
+        if not _is_local_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         form = await request.form()
         updates: dict[str, str] = {}
         for field_name, _, input_type, _ in _SETTING_FIELDS:

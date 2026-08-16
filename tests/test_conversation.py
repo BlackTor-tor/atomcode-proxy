@@ -80,3 +80,53 @@ def test_request_working_directory_accepts_base_url_query_override(tmp_path):
 
     assert path == str(tmp_path.resolve())
     assert source == "query"
+
+
+def test_request_working_directory_allows_override_inside_roots(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    path, source = request_working_directory(
+        {"x-working-directory": str(workspace)},
+        {},
+        str(tmp_path),
+        allowed_roots=[str(tmp_path)],
+    )
+
+    assert path == str(workspace.resolve())
+    assert source == "header"
+
+
+def test_request_working_directory_rejects_override_outside_roots(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    default_dir = tmp_path / "default"
+    default_dir.mkdir()
+
+    path, source = request_working_directory(
+        {"x-working-directory": str(outside)},
+        {},
+        str(default_dir),
+        allowed_roots=[str(default_dir)],
+    )
+
+    assert path == str(default_dir.resolve())
+    assert source == "default"
+
+
+def test_request_working_directory_rejects_query_override_outside_roots(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    default_dir = tmp_path / "default"
+    default_dir.mkdir()
+
+    path, source = request_working_directory(
+        {},
+        {},
+        str(default_dir),
+        {"working_dir": str(outside)},
+        allowed_roots=[str(default_dir)],
+    )
+
+    assert path == str(default_dir.resolve())
+    assert source == "default"

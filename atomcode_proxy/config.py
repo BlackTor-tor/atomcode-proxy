@@ -13,6 +13,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .workdir import normalize_working_directory
+
 log = logging.getLogger("atomcode_proxy.config")
 
 # 项目根目录 = 本文件所在目录的上一级
@@ -145,6 +147,22 @@ def _resolve_working_dir() -> str:
     return raw.strip()
 
 
+def _resolve_workdir_roots() -> list[str]:
+    """解析可选的允许根目录列表（ATOMCODE_WORKDIR_ROOTS，逗号分隔）。
+
+    仅保留已存在的绝对目录；配置后请求级工作目录必须位于任一允许根内。
+    """
+    raw = os.environ.get("ATOMCODE_WORKDIR_ROOTS", "")
+    roots: list[str] = []
+    for item in raw.split(","):
+        normalized = normalize_working_directory(item)
+        if normalized:
+            roots.append(normalized)
+        elif item.strip():
+            log.warning("ATOMCODE_WORKDIR_ROOTS 中的目录不存在，已忽略: %s", item.strip())
+    return roots
+
+
 @dataclass
 class Config:
     """运行时可变的配置对象：网页保存的热更新直接改字段即可。"""
@@ -158,6 +176,9 @@ class Config:
     )
     approval_mode: str = field(default_factory=lambda: _cfg_value("ATOMCODE_APPROVAL_MODE", "bypass"))
     working_dir: str = field(default_factory=_resolve_working_dir)
+
+    # 请求级工作目录允许根（安全围栏）：空列表表示不限制
+    workdir_roots: list[str] = field(default_factory=_resolve_workdir_roots)
 
     # OpenAI 模型别名：逗号分隔的 k=v 列表，如 "claude-3-5-sonnet=AtomGit-deepseek-v4-flash"
     model_alias: dict[str, str] = field(default_factory=dict)

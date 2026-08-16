@@ -51,6 +51,7 @@ flowchart LR
 | `ATOMCODE_DEFAULT_PROVIDER` | `AtomGit-deepseek-v4-flash` | 默认模型 provider |
 | `ATOMCODE_APPROVAL_MODE` | `bypass` | 审批模式 |
 | `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 工作目录；可在设置页修改，也可由请求按客户端覆盖 |
+| `ATOMCODE_WORKDIR_ROOTS` | 空（不限制） | 安全围栏：请求级工作目录允许根，逗号分隔；配置后越界覆盖将被忽略 |
 | `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名 |
 
 > ⚠️ Windows Defender / 杀毒软件可能对 PyInstaller 打包的单文件程序误报（未经数字签名的可执行文件常见现象）。如遇拦截，请添加信任或允许运行，也可按下文自行从源码构建。
@@ -114,6 +115,7 @@ python run.py
 | `ATOMCODE_DEFAULT_PROVIDER` | `AtomGit-deepseek-v4-flash` | 默认模型 provider |
 | `ATOMCODE_APPROVAL_MODE` | `bypass` | 审批模式：`bypass`/`build`/`plan`/`accept_edits` |
 | `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 默认工作目录；可在设置页修改，请求可用 header、body 或 URL 参数覆盖 |
+| `ATOMCODE_WORKDIR_ROOTS` | 空（不限制） | 安全围栏：逗号分隔的允许根目录；配置后请求级目录必须位于任一允许根内，越界覆盖会被忽略并回退默认目录 |
 | `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名，逗号分隔 `k=v`，如 `gpt-4o=AtomGit-deepseek-v4-flash` |
 
 `.env` 加载在 `config.py` 模块导入时完成，无需额外依赖（自带轻量解析，仅支持 `KEY=VALUE`、`#` 注释、引号包裹值）。
@@ -227,6 +229,8 @@ curl http://127.0.0.1:8765/v1/chat/completions \
 4. 代理默认工作目录（未配置时回退到用户主目录）；该值可在设置页修改并保存到用户目录的 `config.json`，作为没有请求级目录的客户端默认值。
 
 请求级目录必须是本机已存在的绝对目录。每个客户端身份、工作目录和会话 ID 都会绑定独立 daemon session；如果客户端没有提供稳定会话 ID，代理会根据完整消息历史前缀识别连续回合，不会把两个新对话共用一个 session。
+
+> 🔒 可选安全围栏：设置环境变量 `ATOMCODE_WORKDIR_ROOTS`（逗号分隔的允许根目录，如 `F:\Projects,C:\work`）后，请求级目录必须位于任一允许根内，越界覆盖会被忽略并回退默认目录，防止请求随意切换 daemon 的文件系统根。另外，设置页保存、目录校验、下载等写操作接口仅接受本机页面来源的请求，恶意网页无法跨站篡改配置。
 
 注意：Cursor、Codex CLI、Claude Code 是否发送工作区路径取决于客户端版本和协议适配器；标准 OpenAI/Anthropic 请求不保证包含 cwd。客户端未发送路径时，代理不能从网络请求反推出 IDE 当前目录，会使用启动时选择的默认目录。
 

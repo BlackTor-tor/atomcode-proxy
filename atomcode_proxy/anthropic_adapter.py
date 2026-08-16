@@ -206,6 +206,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
         body,
         cfg.working_dir,
         request.query_params,
+        allowed_roots=cfg.workdir_roots,
     )
     if not working_dir:
         return JSONResponse(

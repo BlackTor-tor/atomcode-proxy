@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 from .workdir import normalize_working_directory
+
+log = logging.getLogger("atomcode_proxy.conversation")
 
 
 def content_to_text(content: Any) -> str:
@@ -143,13 +147,43 @@ def explicit_conversation_id(headers: Mapping[str, str], body: Mapping[str, Any]
     return None
 
 
+def _is_within_roots(path: str, roots: Sequence[str]) -> bool:
+    """判断已规范化的绝对路径是否位于任一允许根目录内（含根本身）。"""
+    resolved = Path(path)
+    for root in roots:
+        allowed = Path(root)
+        if resolved == allowed or allowed in resolved.parents:
+            return True
+    return False
+
+
 def request_working_directory(
     headers: Mapping[str, str],
     body: Mapping[str, Any],
     default: str | None,
     query: Mapping[str, str] | None = None,
+    allowed_roots: Sequence[str] | None = None,
 ) -> tuple[str | None, str]:
-    """按请求覆盖、URL 参数、协议字段、默认值解析工作目录。"""
+    """按请求覆盖、URL 参数、协议字段、默认值解析工作目录。
+
+    安全围栏：配置 allowed_roots（ATOMCODE_WORKDIR_ROOTS）后，请求级目录
+    必须位于任一允许根内，越界覆盖会被忽略并回退默认目录；未配置时不限制。
+    """
+
+    def _candidate(value: str | None, source: str) -> str | None:
+        """规范化并按允许根过滤候选目录；越界时忽略并回退。"""
+        if not value or not value.strip():
+            return None
+        normalized = normalize_working_directory(value)
+        if normalized and allowed_roots and not _is_within_roots(normalized, allowed_roots):
+            log.warning(
+                "请求级工作目录越界已忽略（source=%s, path=%s），回退默认目录",
+                source,
+                normalized,
+            )
+            return None
+        return normalized
+
     for name in (
         "x-atomcode-working-directory",
         "x-atomcode-working-dir",
@@ -163,25 +197,29 @@ def request_working_directory(
         "x-codex-working-directory",
         "x-claude-code-working-directory",
     ):
-        value = headers.get(name)
-        if value and value.strip():
-            return normalize_working_directory(value), "header"
+        selected = _candidate(headers.get(name), "header")
+        if selected:
+            return selected, "header"
 
     for name in ("working_dir", "working_directory", "cwd", "workspace_path"):
-        value = (query or {}).get(name)
-        if value and value.strip():
-            return normalize_working_directory(value), "query"
+        selected = _candidate((query or {}).get(name), "query")
+        if selected:
+            return selected, "query"
 
     for name in ("working_dir", "workingDir", "working_directory", "cwd", "workspace_path", "workspace"):
         value = body.get(name)
-        if isinstance(value, str) and value.strip():
-            return normalize_working_directory(value), "body"
+        if isinstance(value, str):
+            selected = _candidate(value, "body")
+            if selected:
+                return selected, "body"
 
     metadata = body.get("metadata")
     if isinstance(metadata, dict):
         for name in ("working_dir", "workingDir", "working_directory", "cwd", "workspace_path", "workspace"):
             value = metadata.get(name)
-            if isinstance(value, str) and value.strip():
-                return normalize_working_directory(value), "metadata"
+            if isinstance(value, str):
+                selected = _candidate(value, "metadata")
+                if selected:
+                    return selected, "metadata"
 
     return normalize_working_directory(default), "default"
