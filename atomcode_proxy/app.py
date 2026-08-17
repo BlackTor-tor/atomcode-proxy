@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import json
 import logging
 import sys
 from contextlib import asynccontextmanager
@@ -98,6 +99,10 @@ def _sanitize_download_filename(name: str) -> str:
 def create_app(config: Config | None = None) -> FastAPI:
     cfg = config or Config.from_env()
 
+    # daemon 切换互斥：延迟切换后台任务与设置页立即切换串行化，避免
+    # 并发重建客户端、并发触发主进程侧进程启停造成 cfg/客户端/进程错位
+    daemon_switch_lock = asyncio.Lock()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         daemon = AtomCodeDaemon(
@@ -111,6 +116,17 @@ def create_app(config: Config | None = None) -> FastAPI:
         app.state.config = cfg
         log.info("daemon client ready: %s", cfg.daemon_url)
         yield
+        # 先取消延迟切换后台任务：避免关闭窗口内它再新建无人关闭的客户端
+        # （httpx 泄漏），或其 handler 在退出路径上再次拉起/终止 daemon 进程
+        switch_task = getattr(app.state, "daemon_switch_task", None)
+        if switch_task is not None and not switch_task.done():
+            switch_task.cancel()
+            try:
+                await switch_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.warning("等待 daemon 切换任务退出失败: %s", exc)
         # 关闭当前实际生效的 daemon 客户端：设置页热切换后 app.state.daemon
         # 已是 新 实例，仅关启动实例会漏掉对外部托管 daemon 的会话清理
         current = getattr(app.state, "daemon", daemon)
@@ -292,7 +308,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             log.warning("目录选择超时（%d 秒）", _CHOOSE_DIR_TIMEOUT)
             return JSONResponse(
                 status_code=504,
-                content={"selected": False, "error": "选择目录超时，请重试"},
+                content={"selected": False, "error": "选择目录超时；若对话框仍在显示，请先关闭后再重试"},
             )
         if not selected:
             return JSONResponse({"selected": False, "working_dir": cfg.working_dir})
@@ -492,7 +508,9 @@ def create_app(config: Config | None = None) -> FastAPI:
                 <script>
                 (function() {{
                     var fieldName = "{field_name}";
-                    var currentVal = "{escaped_val}";
+                    // script 块是 raw text，HTML 实体不会解码，需用 JSON 序列化注入；
+                    // 转义 </ 防止值中包含 </script> 截断脚本块
+                    var currentVal = {json.dumps(val).replace("</", "<\\/")};
                     var hiddenEl = document.getElementById("ds_" + fieldName + "_hidden");
                     var selectEl = document.getElementById("ds_" + fieldName + "_select");
                     var textEl = document.getElementById("ds_" + fieldName + "_text");
@@ -547,7 +565,15 @@ def create_app(config: Config | None = None) -> FastAPI:
                         f'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
                     )
             else:
-                input_html = f'<input type="text" name="{field_name}" value="{_escape_attr(val)}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
+                # host/port/daemon 地址等可留空字段：占位符明确“留空保持不变”语义，
+                # 避免用户误以为清空可恢复默认（清空会静默保持当前值）
+                blank_keeps = field_name in (
+                    "ATOMCODE_PROXY_HOST",
+                    "ATOMCODE_PROXY_PORT",
+                    "ATOMCODE_DAEMON_URL",
+                )
+                placeholder = ' placeholder="留空保持不变"' if blank_keeps else ""
+                input_html = f'<input type="text" name="{field_name}" value="{_escape_attr(val)}"{placeholder} style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
             fields_html += f"""
             <div style="margin-bottom:16px;">
                 <label style="display:block;font-weight:600;margin-bottom:4px;color:#444;">{label}</label>
@@ -677,7 +703,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 if not pending or not isinstance(old, AtomCodeDaemon):
                     app.state.pending_daemon_switch = None
                     return
-                if not any(s.lock.locked() for s in old._states.values()):
+                if any(s.lock.locked() for s in old._states.values()):
+                    await asyncio.sleep(2)
+                    continue
+                async with daemon_switch_lock:
+                    # 锁内重读并复核：等待期间设置页可能已完成另一次切换，
+                    # 或旧客户端又开始了新会话（此时释放锁回循环头继续等）
+                    old = getattr(app.state, "daemon", None)
+                    pending = getattr(app.state, "pending_daemon_switch", None)
+                    if not pending or not isinstance(old, AtomCodeDaemon):
+                        return
+                    if any(s.lock.locked() for s in old._states.values()):
+                        continue
                     new_url, new_token = pending
                     # 先原子换上新客户端再关闭旧客户端：切换后新请求立即走新连接，
                     # 避免"判定空闲→关闭完成"期间新请求落在即将关闭的旧客户端上被掐断
@@ -692,19 +729,19 @@ def create_app(config: Config | None = None) -> FastAPI:
                     cfg.daemon_url = new_url
                     cfg.daemon_token = new_token
                     log.info("Daemon 连接已在任务结束后切换: %s", new_url)
+                # 锁外收尾：关闭旧客户端与同步进程生命周期，不阻塞下一次切换
+                try:
+                    await old.close()
+                except Exception as exc:
+                    log.warning("关闭旧 daemon 客户端失败: %s", exc)
+                # 同步主进程侧生命周期：停旧进程并按新配置拉起
+                handler = getattr(app.state, "on_daemon_config_changed", None)
+                if handler is not None:
                     try:
-                        await old.close()
+                        await asyncio.to_thread(handler, new_url)
                     except Exception as exc:
-                        log.warning("关闭旧 daemon 客户端失败: %s", exc)
-                    # 同步主进程侧生命周期：停旧进程并按新配置拉起
-                    handler = getattr(app.state, "on_daemon_config_changed", None)
-                    if handler is not None:
-                        try:
-                            await asyncio.to_thread(handler, new_url)
-                        except Exception as exc:
-                            log.warning("同步 daemon 进程生命周期失败: %s", exc)
-                    return
-                await asyncio.sleep(2)
+                        log.warning("同步 daemon 进程生命周期失败: %s", exc)
+                return
 
         app.state.daemon_switch_task = asyncio.create_task(_switch_when_idle())
 
@@ -725,8 +762,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             updates.pop("ATOMCODE_PROXY_HOST", None)
             host = ""
         if not host:
-            # 留空 = 保持不变：空值持久化会从用户配置文件删除该项，导致重启后丢失
+            # 留空 = 保持不变：空值持久化会从用户配置文件删除该项，导致重启后丢失。
+            # 若用户曾自定义过该项，明确告知恢复默认需手动填写默认值
             updates.pop("ATOMCODE_PROXY_HOST", None)
+            if "ATOMCODE_PROXY_HOST" in read_user_config():
+                messages.append("监听地址留空：保持当前值不变（如需恢复默认请手动填写 127.0.0.1）")
         host_changed = bool(host) and host != cfg.host
         port_changed = False
         if port_raw:
@@ -741,6 +781,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 updates.pop("ATOMCODE_PROXY_PORT", None)
         else:
             updates.pop("ATOMCODE_PROXY_PORT", None)
+            if "ATOMCODE_PROXY_PORT" in read_user_config():
+                messages.append("监听端口留空：保持当前值不变（如需恢复默认请手动填写 8765）")
         if host_changed or port_changed:
             messages.append("监听地址/端口已保存，重启服务后生效")
 
@@ -753,6 +795,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         # 用户配置文件删除该项，重启后回退默认值导致 daemon 认证失败
         if not updates.get("ATOMCODE_DAEMON_TOKEN", "").strip():
             persist_updates.pop("ATOMCODE_DAEMON_TOKEN", None)
+        # 默认 Provider / Daemon 地址留空 = 保持不变（与 host/port/token 同语义）：
+        # 空值持久化会从用户配置文件删除该项，重启后静默回退默认值
+        if not updates.get("ATOMCODE_DEFAULT_PROVIDER", "").strip():
+            persist_updates.pop("ATOMCODE_DEFAULT_PROVIDER", None)
+        if not updates.get("ATOMCODE_DAEMON_URL", "").strip():
+            persist_updates.pop("ATOMCODE_DAEMON_URL", None)
         if new_provider:
             cfg.default_provider = new_provider
         if new_mode:
@@ -769,15 +817,22 @@ def create_app(config: Config | None = None) -> FastAPI:
             messages.append("工作目录不能为空；请保留现有目录或选择一个新目录")
             persist_updates.pop("ATOMCODE_PROXY_WORKDIR", None)
 
-        # 模型别名：解析 k=v 列表（允许清空）
+        # 模型别名：解析 k=v 列表（允许清空）；非法片段不静默丢弃，向用户反馈
         aliases: dict[str, str] = {}
+        invalid_alias_parts: list[str] = []
         raw = updates.get("ATOMCODE_MODEL_ALIAS", "")
         for pair in raw.split(","):
             if "=" in pair:
                 k, v = pair.split("=", 1)
                 if k.strip() and v.strip():
                     aliases[k.strip()] = v.strip()
+                elif pair.strip():
+                    invalid_alias_parts.append(pair.strip())
+            elif pair.strip():
+                invalid_alias_parts.append(pair.strip())
         cfg.model_alias = aliases
+        if invalid_alias_parts:
+            messages.append("以下模型别名格式无效已忽略（应为 k=v）：" + "、".join(invalid_alias_parts))
 
         # Daemon 地址/Token：变化则重建 daemon 客户端（用新 cfg），立即生效
         new_daemon_url = updates.get("ATOMCODE_DAEMON_URL", "").strip() or cfg.daemon_url
@@ -785,43 +840,49 @@ def create_app(config: Config | None = None) -> FastAPI:
         daemon_url_changed = new_daemon_url != cfg.daemon_url
         daemon_token_changed = bool(new_daemon_token) and new_daemon_token != cfg.daemon_token
         if daemon_url_changed or daemon_token_changed:
-            old = app.state.daemon
-            busy = isinstance(old, AtomCodeDaemon) and any(s.lock.locked() for s in old._states.values())
-            try:
-                if busy:
-                    # 有进行中的任务：立即 close 会终止所有客户端正在执行的会话，
-                    # 推迟到任务结束后再切换（期间新请求仍走旧连接）。
-                    # 此时不能提前改写 cfg：看门狗按 cfg.daemon_url 检测存活，
-                    # 提前指向新地址会在延迟窗口内误杀承载在途会话的旧 daemon 进程。
-                    app.state.pending_daemon_switch = (new_daemon_url, new_daemon_token or cfg.daemon_token)
-                    messages.append("检测到进行中的任务：Daemon 连接将在任务结束后自动切换（期间新请求仍走旧连接）")
-                    _schedule_daemon_switch(app)
-                else:
-                    cfg.daemon_url = new_daemon_url
-                    if new_daemon_token:
-                        cfg.daemon_token = new_daemon_token
-                    if old is not None:
-                        await old.close()
-                    app.state.pending_daemon_switch = None
-                    app.state.daemon = AtomCodeDaemon(
-                        cfg.daemon_url,
-                        daemon_token=cfg.daemon_token,
-                        default_provider=cfg.default_provider,
-                        approval_mode=cfg.approval_mode,
-                        default_working_dir=cfg.working_dir,
-                    )
-                    messages.append("Daemon 连接已更新并立即生效（原有会话上下文已重置）")
-                    # 同步主进程侧 daemon 进程生命周期（停旧进程、按新配置拉起），
-                    # 避免看门狗下一轮另起进程后旧进程泄漏为孤儿
-                    handler = getattr(app.state, "on_daemon_config_changed", None)
-                    if handler is not None:
-                        try:
-                            await asyncio.to_thread(handler, cfg.daemon_url)
-                        except Exception as exc:
-                            log.warning("同步 daemon 进程生命周期失败: %s", exc)
-            except Exception as exc:
-                log.warning("重建 daemon 客户端失败: %s", exc)
-                messages.append(f"Daemon 配置已保存，但重建连接失败: {exc}")
+            # 整个切换序列与延迟切换后台任务互斥：并发重建客户端/并发触发
+            # 主进程侧启停会交错覆盖，造成 cfg、客户端与 daemon 进程三方错位
+            async with daemon_switch_lock:
+                old = app.state.daemon
+                busy = isinstance(old, AtomCodeDaemon) and any(s.lock.locked() for s in old._states.values())
+                try:
+                    if busy:
+                        # 有进行中的任务：立即 close 会终止所有客户端正在执行的会话，
+                        # 推迟到任务结束后再切换（期间新请求仍走旧连接）。
+                        # 此时不能提前改写 cfg：看门狗按 cfg.daemon_url 检测存活，
+                        # 提前指向新地址会在延迟窗口内误杀承载在途会话的旧 daemon 进程。
+                        app.state.pending_daemon_switch = (new_daemon_url, new_daemon_token or cfg.daemon_token)
+                        messages.append("检测到进行中的任务：Daemon 连接将在任务结束后自动切换（期间新请求仍走旧连接）")
+                        _schedule_daemon_switch(app)
+                    else:
+                        cfg.daemon_url = new_daemon_url
+                        if new_daemon_token:
+                            cfg.daemon_token = new_daemon_token
+                        app.state.pending_daemon_switch = None
+                        # 先原子换上新客户端再关闭旧客户端：close 期间（含逐会话
+                        # 发 stop 的网络等待）新请求立即走新连接，不会踩到已关闭的
+                        # httpx 客户端上抛 RuntimeError
+                        app.state.daemon = AtomCodeDaemon(
+                            cfg.daemon_url,
+                            daemon_token=cfg.daemon_token,
+                            default_provider=cfg.default_provider,
+                            approval_mode=cfg.approval_mode,
+                            default_working_dir=cfg.working_dir,
+                        )
+                        messages.append("Daemon 连接已更新并立即生效（原有会话上下文已重置）")
+                        if old is not None:
+                            await old.close()
+                        # 同步主进程侧 daemon 进程生命周期（停旧进程、按新配置拉起），
+                        # 避免看门狗下一轮另起进程后旧进程泄漏为孤儿
+                        handler = getattr(app.state, "on_daemon_config_changed", None)
+                        if handler is not None:
+                            try:
+                                await asyncio.to_thread(handler, cfg.daemon_url)
+                            except Exception as exc:
+                                log.warning("同步 daemon 进程生命周期失败: %s", exc)
+                except Exception as exc:
+                    log.warning("重建 daemon 客户端失败: %s", exc)
+                    messages.append(f"Daemon 配置已保存，但重建连接失败: {exc}")
         else:
             # daemon_url/token 未变：同步 provider/mode/workdir 到现有客户端
             daemon = getattr(app.state, "daemon", None)

@@ -3,6 +3,9 @@
 覆盖：
 - Host 头白名单校验（防 DNS rebinding）
 - _stop_chat_shielded 重新抛出 CancelledError
+- 客户端断开（GeneratorExit）同样通知 daemon 停止
+- daemon 返回非 JSON 响应转为 502 语义错误
+- 看门狗远程 daemon_url 不做本机重启判定
 - 会话超量按 LRU 淘汰并停止被淘汰 session
 - Anthropic 流式 reasoning -> thinking block
 - _parse_version 预发布比较
@@ -17,7 +20,7 @@ import atomcode_proxy.daemon as daemon_module
 from atomcode_proxy.app import _sanitize_download_filename, create_app
 from atomcode_proxy.config import Config
 from atomcode_proxy.conversation import ConversationKeyResolver
-from atomcode_proxy.daemon import AtomCodeDaemon
+from atomcode_proxy.daemon import AtomCodeDaemon, AtomCodeDaemonError
 from atomcode_proxy.updater import _parse_version
 from tests.test_adapters import ErrorDaemon, FakeDaemon
 from tests.test_daemon_lifecycle import FakeResponse
@@ -118,6 +121,102 @@ def test_stop_chat_shielded_propagates_cancel_and_completes_stop():
         assert ("/chat/stop", {"json": {"session_id": "session-9"}}) in posts
 
     asyncio.run(run())
+
+
+def test_client_disconnect_via_generator_exit_stops_daemon_chat():
+    """客户端断开时若正挂在 yield 点，GeneratorExit 也必须触发 /chat/stop。
+
+    否则 bypass 模式下 daemon 侧 agent 任务在用户取消后继续执行。"""
+
+    async def run():
+        daemon = AtomCodeDaemon()
+        client = FakeClientForStop()
+        daemon._client = client
+
+        async def fake_stream(*args, **kwargs):
+            yield {"type": "text", "content": "partial"}
+            await asyncio.sleep(60)
+
+        daemon._chat_stream_raw = fake_stream
+
+        gen = daemon.chat_with_session(
+            "hello", working_dir="F:/workspace", conversation_key="conversation-1"
+        )
+        first = await gen.__anext__()
+        assert first["type"] == "text"
+        # 模拟客户端断开：生成器被关闭，GeneratorExit 注入 yield 挂起点
+        await gen.aclose()
+
+        assert ("/chat/stop", {"json": {"session_id": "session-1"}}) in client.posts
+
+    asyncio.run(run())
+
+
+class FakeClientForStop:
+    def __init__(self):
+        self.posts = []
+
+    async def post(self, path, **kwargs):
+        self.posts.append((path, kwargs))
+        if path == "/sessions":
+            return FakeResponse(payload={"session_id": "session-1"})
+        return FakeResponse()
+
+    async def aclose(self):
+        return None
+
+
+class NonJsonResponse:
+    """200 但响应体非 JSON（如端口被其他 HTTP 服务占用返回 HTML）。"""
+
+    status_code = 200
+    text = "<html>not json</html>"
+
+    def json(self):
+        raise ValueError("Expecting value")
+
+
+class NonJsonClient:
+    async def post(self, path, **kwargs):
+        return NonJsonResponse()
+
+    async def get(self, path, **kwargs):
+        return NonJsonResponse()
+
+    async def aclose(self):
+        return None
+
+
+def test_daemon_non_json_response_raises_502_semantic_error():
+    """daemon 返回 200 非 JSON 体：应抛 502 语义的 AtomCodeDaemonError 而非穿透 500。"""
+
+    async def run():
+        daemon = AtomCodeDaemon()
+        daemon._client = NonJsonClient()
+
+        for action in (
+            lambda: daemon._create_session("F:/workspace"),
+            daemon.list_models,
+        ):
+            try:
+                await action()
+            except AtomCodeDaemonError as exc:
+                assert exc.status_code == 502
+                assert "non-JSON" in str(exc)
+            else:
+                raise AssertionError("非 JSON 响应应抛 AtomCodeDaemonError")
+
+    asyncio.run(run())
+
+
+def test_daemon_url_is_local_detection():
+    """看门狗/启动路径的本机判定：远程地址不做本机进程管理。"""
+    from atomcode_proxy.__main__ import _daemon_url_is_local
+
+    assert _daemon_url_is_local("http://127.0.0.1:13456") is True
+    assert _daemon_url_is_local("http://localhost:13456") is True
+    assert _daemon_url_is_local("http://[::1]:13456") is True
+    assert _daemon_url_is_local("http://192.168.1.100:13456") is False
 
 
 def test_state_eviction_is_lru_and_stops_evicted_session():

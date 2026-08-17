@@ -225,9 +225,16 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
+    # messages 类型前置校验：非 list 或元素非 dict 会在消息规范化层抛
+    # AttributeError 落为 500，应按非法输入返回 400
+    messages = body.get("messages", [])
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "messages must be a list of message objects", "type": "invalid_request_error"}},
+        )
     provider = await daemon.resolve_provider(model_raw, cfg.model_alias, cfg.default_provider)
     stream = bool(body.get("stream", False))
-    messages = body.get("messages", [])
     message = _extract_user_message(messages)
     if not message:
         return JSONResponse(status_code=400, content={"error": {"message": "empty user message", "type": "invalid_request_error"}})
@@ -562,10 +569,17 @@ async def create_response(request: Request) -> StreamingResponse | JSONResponse:
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
+    # input 类型前置校验：非字符串/数组（如 int）会在消息转换层抛 TypeError 落为 500
+    input_raw = body.get("input")
+    if input_raw is not None and not isinstance(input_raw, (str, list)):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "input must be a string or an array of input items", "type": "invalid_request_error"}},
+        )
     provider = await daemon.resolve_provider(model_raw, cfg.model_alias, cfg.default_provider)
     stream = bool(body.get("stream", False))
 
-    messages = _responses_input_to_messages(body.get("input"))
+    messages = _responses_input_to_messages(input_raw)
     instructions = body.get("instructions")
     if instructions:
         messages.insert(0, {"role": "system", "content": _responses_content_text(instructions)})

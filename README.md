@@ -59,8 +59,8 @@ flowchart LR
 
 ## 前置条件
 
-- **便携版（exe）**：无需任何前置条件，双击即可运行。程序会自动检测并启动 AtomCode daemon。
-- **源码运行**：需要 Python 3.10+ 和 AtomCode daemon（程序同样会自动启动 daemon）。
+- **便携版（exe）**：无需任何前置条件，双击即可运行。程序会自动检测并启动 AtomCode daemon（Windows）。
+- **源码运行**：需要 Python 3.10+ 和 AtomCode daemon。Windows 上程序会自动启动 daemon（查找 `%LOCALAPPDATA%\AtomCode\atomcode.exe` 等标准位置）；其他平台需设置 `ATOMCODE_DAEMON_PATH` 环境变量指定路径，或手动启动 daemon。
 
 安装依赖（源码模式）：
 
@@ -121,7 +121,7 @@ python run.py
 | `ATOMCODE_DAEMON_PATH` | 自动查找 | AtomCode daemon（atomcode.exe）路径；仅在自动查找失败时指定 |
 | `ATOMCODE_PROXY_ENV` | 自动定位 | 指定 `.env` 文件路径（默认 exe 旁或项目根目录） |
 
-`.env` 加载在 `config.py` 模块导入时完成，无需额外依赖（自带轻量解析，仅支持 `KEY=VALUE`、`#` 注释、引号包裹值）。
+`.env` 加载在 `config.py` 模块导入时完成，无需额外依赖（自带轻量解析，仅支持 `KEY=VALUE`、`#` 注释、引号包裹值）。注意：`.env` 中的值仅在代理进程内生效，不会写入系统环境变量，也不会传递给 daemon 子进程及其他外部程序；如需为 daemon 配置环境变量，请在系统环境变量中设置。
 
 ## 客户端接入
 

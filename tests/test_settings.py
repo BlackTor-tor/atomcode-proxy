@@ -214,6 +214,145 @@ def test_choose_working_dir_timeout_returns_structured_504(tmp_path, monkeypatch
     asyncio.run(run())
 
 
+def test_settings_save_keeps_persisted_provider_and_daemon_url_when_left_blank(tmp_path, monkeypatch):
+    """Provider / Daemon 地址留空 = 保持不变：不得从配置文件删除已存值。"""
+
+    async def run():
+        cfg_path = tmp_path / "user-config" / "atomcode-proxy-config.json"
+        monkeypatch.setattr(config_module, "user_config_path", lambda: cfg_path)
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "ATOMCODE_DEFAULT_PROVIDER": "MyProvider",
+                    "ATOMCODE_DAEMON_URL": "http://192.168.1.5:13456",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        app = create_app(
+            Config(
+                working_dir=str(tmp_path),
+                default_provider="MyProvider",
+                daemon_url="http://192.168.1.5:13456",
+            )
+        )
+        app.state.daemon = FakeDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
+            response = await client.post(
+                "/settings",
+                data={
+                    "ATOMCODE_DEFAULT_PROVIDER": "",
+                    "ATOMCODE_DAEMON_URL": "",
+                },
+            )
+
+        assert response.status_code == 200
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert saved.get("ATOMCODE_DEFAULT_PROVIDER") == "MyProvider"
+        assert saved.get("ATOMCODE_DAEMON_URL") == "http://192.168.1.5:13456"
+        # 运行时值也保持不变
+        assert app.state.config.default_provider == "MyProvider"
+        assert app.state.config.daemon_url == "http://192.168.1.5:13456"
+
+    asyncio.run(run())
+
+
+def test_settings_save_reports_invalid_model_alias_parts(tmp_path, monkeypatch):
+    """非法别名片段不得静默丢弃：保存后应向用户反馈被忽略的片段。"""
+
+    async def run():
+        cfg_path = tmp_path / "user-config" / "atomcode-proxy-config.json"
+        monkeypatch.setattr(config_module, "user_config_path", lambda: cfg_path)
+
+        app = create_app(Config(working_dir=str(tmp_path)))
+        app.state.daemon = FakeDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
+            response = await client.post(
+                "/settings",
+                data={"ATOMCODE_MODEL_ALIAS": "gpt-4o AtomGit-x,ok=AtomGit-y"},
+            )
+
+        assert response.status_code == 200
+        assert "格式无效已忽略" in response.text
+        assert "gpt-4o AtomGit-x" in response.text
+        assert app.state.config.model_alias == {"ok": "AtomGit-y"}
+
+    asyncio.run(run())
+
+
+def test_settings_save_immediate_daemon_switch_swaps_client_before_close(tmp_path, monkeypatch):
+    """立即切换路径：新客户端先生效再关旧客户端，新请求不落在已关闭客户端上。"""
+
+    async def run():
+        cfg_path = tmp_path / "user-config" / "atomcode-proxy-config.json"
+        monkeypatch.setattr(config_module, "user_config_path", lambda: cfg_path)
+
+        app = create_app(Config(working_dir=str(tmp_path)))
+        from atomcode_proxy.daemon import AtomCodeDaemon
+
+        old_client = AtomCodeDaemon("http://127.0.0.1:13456")
+        app.state.daemon = old_client
+        closed = []
+
+        async def record_close():
+            # 记录关闭时刻 app.state.daemon 是否已换新：若仍指向旧客户端，
+            # close 窗口内的新请求会踩到已关闭的 httpx 客户端
+            closed.append(app.state.daemon is not old_client)
+            await asyncio.sleep(0)
+
+        old_client.close = record_close
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
+            response = await client.post(
+                "/settings",
+                data={"ATOMCODE_DAEMON_URL": "http://127.0.0.1:23456"},
+            )
+
+        assert response.status_code == 200
+        assert closed == [True]
+        assert app.state.daemon.base_url == "http://127.0.0.1:23456"
+        await app.state.daemon.close()
+
+    asyncio.run(run())
+
+
+def test_chat_endpoints_reject_non_list_messages(tmp_path):
+    """messages 非消息对象列表 / input 非法类型：返回 400 而非 500。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        app.state.daemon = FakeDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            openai_str = await client.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": "hello"},
+            )
+            openai_mixed = await client.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "hi"}, "bare"]},
+            )
+            anthropic_dict = await client.post(
+                "/v1/messages",
+                json={"model": "x", "messages": {"a": 1}},
+            )
+            responses_int = await client.post(
+                "/v1/responses",
+                json={"model": "x", "input": 123},
+            )
+
+        assert openai_str.status_code == 400
+        assert openai_mixed.status_code == 400
+        assert anthropic_dict.status_code == 400
+        assert responses_int.status_code == 400
+
+    asyncio.run(run())
+
+
 def test_models_and_health_endpoints(tmp_path):
     async def run():
         app = create_app(Config(working_dir=str(tmp_path)))

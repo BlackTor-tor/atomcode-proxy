@@ -25,7 +25,14 @@ def content_to_text(content: Any) -> str:
                 if block.get("type") == "text":
                     parts.append(str(block.get("text", "")))
                 elif block.get("type") == "image_url":
-                    parts.append(f"[image: {block.get('image_url', '')}]")
+                    # base64 内联图可达 MB 级：只保留截断摘要，避免会话指纹与
+                    # daemon 导入被图片数据放大造成内存/带宽峰值
+                    image_url = block.get("image_url", "")
+                    if isinstance(image_url, dict):
+                        url = str(image_url.get("url", ""))
+                    else:
+                        url = str(image_url)
+                    parts.append(f"[image: {url[:256]}]")
                 elif block.get("type") == "image":
                     parts.append("[image]")
                 elif block.get("type") in ("tool_use", "tool_result", "thinking"):

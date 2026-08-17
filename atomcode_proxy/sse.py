@@ -47,3 +47,7 @@ async def with_heartbeat(
     finally:
         events_task.cancel()
         beat_task.cancel()
+        # 等待被取消的 task 落地：若 events_task 此刻恰以业务异常完成（如 daemon
+        # 断连），不 await 会造成 "exception was never retrieved" 告警。
+        # 若当前协程自身被取消，CancelledError 从 gather 正常向外传播。
+        await asyncio.gather(events_task, beat_task, return_exceptions=True)

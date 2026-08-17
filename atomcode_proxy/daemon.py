@@ -115,7 +115,14 @@ class AtomCodeDaemon:
             raise _wrap_httpx_errors(exc) from exc
         if resp.status_code < 200 or resp.status_code >= 300:
             raise AtomCodeDaemonError(f"create session failed: {resp.status_code} {resp.text[:300]}", resp.status_code)
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            # 端口可能被其他 HTTP 服务占用（返回 HTML 200），解析失败需转为
+            # 502 语义而非穿透为裸 500
+            raise AtomCodeDaemonError(
+                f"daemon returned non-JSON response: {resp.text[:200]!r}", 502
+            ) from exc
         sid = data.get("session_id") or data.get("id")
         if not sid:
             raise AtomCodeDaemonError(f"create session: no session_id in {data!r}")
@@ -211,7 +218,12 @@ class AtomCodeDaemon:
             raise _wrap_httpx_errors(exc) from exc
         if resp.status_code != 200:
             raise AtomCodeDaemonError(f"list models failed: {resp.status_code} {resp.text[:300]}")
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            raise AtomCodeDaemonError(
+                f"daemon returned non-JSON response: {resp.text[:200]!r}", 502
+            ) from exc
 
     async def known_providers(self) -> set[str]:
         """返回 daemon 已知 provider 名集合（带 TTL 缓存）。
@@ -314,9 +326,14 @@ class AtomCodeDaemon:
                         await self._stop_chat_shielded(session_id)
                         state.session_id = None
                         session_id = await self._ensure_session(state, history or [])
-            except asyncio.CancelledError:
-                await self._stop_chat_shielded(session_id)
-                raise
+            except (asyncio.CancelledError, GeneratorExit):
+                # 客户端断开时若正挂在 yield 点（事件已产出待消费），生成器被
+                # 注入的是 GeneratorExit 而非 CancelledError，两类终止信号都
+                # 必须通知 daemon 停止任务，否则 bypass 模式下 agent 会继续执行。
+                try:
+                    await self._stop_chat_shielded(session_id)
+                finally:
+                    raise
 
     async def _chat_stream_raw(
         self,

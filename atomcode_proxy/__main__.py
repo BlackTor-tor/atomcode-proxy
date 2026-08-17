@@ -169,17 +169,33 @@ def _stop_daemon(proc: subprocess.Popen | None) -> None:
 # daemon 看门狗
 # ---------------------------------------------------------------------------
 
+def _daemon_url_is_local(daemon_url: str) -> bool:
+    """判断 daemon_url 是否指向本机回环地址。
+
+    远程 daemon 宕机时不应在本机拉起 daemon（既连不上目标又意外多出
+    本地服务），也不应陷入“拉起→检测远程仍不可达→杀掉再拉起”的循环。
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(daemon_url).hostname or "127.0.0.1").lower()
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 def _daemon_watchdog(
     cfg: Config,
     daemon_exe: Path | None,
     daemon_proc_holder: list[subprocess.Popen | None],
     daemon_proc_lock: threading.Lock,
     stop_event: threading.Event,
+    daemon_restart_lock: threading.Lock,
 ) -> None:
     """后台看门狗线程：每 60 秒检测 daemon 是否存活，失效则自动重启。
 
     daemon_proc_holder: 单元素列表，用于在闭包中可变引用 daemon 进程对象；
     与主线程的读写均需持有 daemon_proc_lock，避免退出时漏停被替换的进程。
+    daemon_restart_lock: 进程启停序列互斥锁，与设置页触发的
+    _on_daemon_config_changed 工作线程串行化，避免交错启停互相杀掉
+    对方刚拉起的进程。
     stop_event: 代理退出时 set，看门狗随之退出。
     """
     log.info("daemon 看门狗已启动（检测间隔 60 秒）")
@@ -194,24 +210,33 @@ def _daemon_watchdog(
         # 检测 daemon 是否仍在运行
         if _is_daemon_running(cfg.daemon_url):
             continue
-        # daemon 失效，尝试重启
-        log.warning("检测到 daemon 失效，正在重启...")
-        exe = daemon_exe or _find_daemon_executable()
-        if exe is None:
-            log.warning("未找到 atomcode.exe，无法重启 daemon")
+        # 远程 daemon 不做本机进程管理，仅告警等待其恢复
+        if not _daemon_url_is_local(cfg.daemon_url):
+            log.warning("daemon_url 指向远程主机且不可达，跳过本机重启: %s", cfg.daemon_url)
             continue
-        new_proc = _start_daemon(exe, cfg.daemon_port)
-        if new_proc is not None:
-            log.info("daemon 已重启 (PID: %d)", new_proc.pid)
-            with daemon_proc_lock:
-                old_proc = daemon_proc_holder[0]
-                daemon_proc_holder[0] = new_proc
-            # 锁外停止旧进程：避免长时间持锁阻塞主线程退出路径
-            _stop_daemon(old_proc)
-            # 等待新 daemon 就绪；stop_event 响应式等待，退出时立即返回
-            stop_event.wait(2.0)
-        else:
-            log.warning("daemon 重启失败，将在下次检测时重试")
+        # 重启序列与设置页回调线程互斥
+        with daemon_restart_lock:
+            # 拿锁后二次确认仍失效：回调线程可能刚完成拉起
+            if _is_daemon_running(cfg.daemon_url):
+                continue
+            # daemon 失效，尝试重启
+            log.warning("检测到 daemon 失效，正在重启...")
+            exe = daemon_exe or _find_daemon_executable()
+            if exe is None:
+                log.warning("未找到 atomcode.exe，无法重启 daemon")
+                continue
+            new_proc = _start_daemon(exe, cfg.daemon_port)
+            if new_proc is not None:
+                log.info("daemon 已重启 (PID: %d)", new_proc.pid)
+                with daemon_proc_lock:
+                    old_proc = daemon_proc_holder[0]
+                    daemon_proc_holder[0] = new_proc
+                # 锁外停止旧进程：避免长时间持锁阻塞主线程退出路径
+                _stop_daemon(old_proc)
+            else:
+                log.warning("daemon 重启失败，将在下次检测时重试")
+        # 等待新 daemon 就绪；stop_event 响应式等待，退出时立即返回
+        stop_event.wait(2.0)
     log.info("daemon 看门狗已停止")
 
 
@@ -349,6 +374,10 @@ def main() -> None:
     if _is_daemon_running(cfg.daemon_url):
         daemon_status_msg = "检测到 AtomCode daemon 已在运行"
         log.info(daemon_status_msg)
+    elif not _daemon_url_is_local(cfg.daemon_url):
+        # 远程 daemon 且不可达：不在本机拉起进程，避免意外多出本地服务
+        daemon_status_msg = "daemon 地址指向远程主机且当前不可达，代理将继续运行（请确认远程 daemon 已启动）"
+        log.warning(daemon_status_msg)
     else:
         daemon_exe = _find_daemon_executable()
         if daemon_exe is not None:
@@ -371,12 +400,15 @@ def main() -> None:
     # 用列表持有 daemon 进程引用，以便看门狗重启时更新；
     # 与看门狗线程的读写用锁同步，避免退出时漏停被替换的进程
     daemon_proc_lock = threading.Lock()
+    # daemon 进程启停序列互斥：看门狗与设置页回调（_on_daemon_config_changed）
+    # 都会执行“停旧→起新→写 holder”，交错执行会互相杀掉对方刚拉起的进程
+    daemon_restart_lock = threading.Lock()
     daemon_proc_holder: list[subprocess.Popen | None] = [daemon_proc]
     # 记住 daemon 可执行文件路径，避免看门狗重复查找
     daemon_exe_cached = _find_daemon_executable() if daemon_proc is None else None
     watchdog_thread = threading.Thread(
         target=_daemon_watchdog,
-        args=(cfg, daemon_exe_cached, daemon_proc_holder, daemon_proc_lock, watchdog_stop),
+        args=(cfg, daemon_exe_cached, daemon_proc_holder, daemon_proc_lock, watchdog_stop, daemon_restart_lock),
         daemon=True,
     )
     watchdog_thread.start()
@@ -449,19 +481,21 @@ def main() -> None:
         parsed = urlparse(new_url)
         host = (parsed.hostname or "127.0.0.1").lower()
         port = parsed.port or 13456
-        with daemon_proc_lock:
-            old_proc = daemon_proc_holder[0]
-            daemon_proc_holder[0] = None
-        _stop_daemon(old_proc)
-        if host in ("127.0.0.1", "localhost", "::1"):
-            exe = _find_daemon_executable()
-            if exe is not None and not _is_daemon_running(new_url):
-                new_proc = _start_daemon(exe, port)
-                if new_proc is not None:
-                    with daemon_proc_lock:
-                        _stop_daemon(daemon_proc_holder[0])
-                        daemon_proc_holder[0] = new_proc
-                    log.info("daemon 已按新配置拉起 (PID: %d)", new_proc.pid)
+        # 与看门狗的重启序列互斥：交错执行会互相杀掉对方刚拉起的进程
+        with daemon_restart_lock:
+            with daemon_proc_lock:
+                old_proc = daemon_proc_holder[0]
+                daemon_proc_holder[0] = None
+            _stop_daemon(old_proc)
+            if host in ("127.0.0.1", "localhost", "::1"):
+                exe = _find_daemon_executable()
+                if exe is not None and not _is_daemon_running(new_url):
+                    new_proc = _start_daemon(exe, port)
+                    if new_proc is not None:
+                        with daemon_proc_lock:
+                            _stop_daemon(daemon_proc_holder[0])
+                            daemon_proc_holder[0] = new_proc
+                        log.info("daemon 已按新配置拉起 (PID: %d)", new_proc.pid)
 
     app.state.on_daemon_config_changed = _on_daemon_config_changed
 

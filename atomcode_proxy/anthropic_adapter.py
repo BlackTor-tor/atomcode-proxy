@@ -302,6 +302,17 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
+    # messages 类型前置校验：非 list 或元素非 dict 会在消息规范化层抛
+    # AttributeError 落为 500，应按非法输入返回 400
+    msgs_raw = body.get("messages", [])
+    if not isinstance(msgs_raw, list) or not all(isinstance(m, dict) for m in msgs_raw):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "messages must be a list of message objects"},
+            },
+        )
     provider = await daemon.resolve_provider(model_raw, cfg.model_alias, cfg.default_provider)
     stream = bool(body.get("stream", False))
     msgs = _messages_with_system(body)
