@@ -17,6 +17,7 @@ from .daemon import AtomCodeDaemon, AtomCodeDaemonError
 from .conversation import (
     client_scope,
     explicit_conversation_id,
+    previous_response_id,
     request_working_directory,
     split_prompt_messages,
 )
@@ -175,9 +176,29 @@ async def _chat_to_openai_object(
     }
 
 
+async def _parse_json_body(request: Request) -> dict[str, Any] | JSONResponse:
+    """解析请求 JSON 体；非法 JSON 或非对象返回 400 而非落为 500。"""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "invalid JSON body", "type": "invalid_request_error"}},
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "request body must be a JSON object", "type": "invalid_request_error"}},
+        )
+    return body
+
+
 @router.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
-    body = await request.json()
+    parsed = await _parse_json_body(request)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    body: dict[str, Any] = parsed
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
@@ -493,7 +514,10 @@ async def _responses_to_object(
 
 @router.post("/v1/responses", response_model=None)
 async def create_response(request: Request) -> StreamingResponse | JSONResponse:
-    body = await request.json()
+    parsed = await _parse_json_body(request)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    body: dict[str, Any] = parsed
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
@@ -520,16 +544,27 @@ async def create_response(request: Request) -> StreamingResponse | JSONResponse:
         return JSONResponse(status_code=400, content={"error": {"message": "working directory is not configured or does not exist", "type": "invalid_request_error"}})
     resolver = request.app.state.conversation_resolver
     scope = client_scope(request.headers, provider)
-    conversation_key = resolver.resolve(scope, history, explicit_conversation_id(request.headers, body))
+    # previous_response_id 优先：Codex 每轮引用上一轮响应，需映射回同一逻辑会话
+    # 以复用 daemon session（否则每轮新建 session 并全量导入历史）。
+    prev_resp = previous_response_id(body)
+    conversation_key = resolver.resolve(
+        scope,
+        history,
+        prev_resp or explicit_conversation_id(request.headers, body),
+    )
+    # 提前生成本轮的 response_id 并登记映射，供客户端下轮 previous_response_id 解析
+    resp_id = _gen_resp_id()
+    resolver.remember_response(scope, resp_id, conversation_key)
     resolver.remember(scope, conversation_key, messages)
     log.info("responses request scope=%s conversation=%s working_dir=%s source=%s", scope, conversation_key, working_dir, working_dir_source)
 
     model_reported = model_raw or provider
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
     if stream:
         gen = _responses_to_events(
             daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported,
-            resp_id=_gen_resp_id(), msg_id=f"msg_{uuid.uuid4().hex[:24]}",
+            resp_id=resp_id, msg_id=msg_id,
             client_key=client_key, conversation_key=conversation_key, history=history,
         )
         return StreamingResponse(
@@ -540,7 +575,7 @@ async def create_response(request: Request) -> StreamingResponse | JSONResponse:
     try:
         obj = await _responses_to_object(
             daemon, prompt, working_dir=working_dir, provider=provider,
-            model_reported=model_reported, resp_id=_gen_resp_id(), msg_id=f"msg_{uuid.uuid4().hex[:24]}",
+            model_reported=model_reported, resp_id=resp_id, msg_id=msg_id,
             client_key=client_key, conversation_key=conversation_key, history=history,
         )
         return JSONResponse(obj)

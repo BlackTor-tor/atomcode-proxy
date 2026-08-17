@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import httpx
 
 from . import __version__
-from .config import Config, read_user_config, write_user_config
+from .config import Config, environ_or_dotenv, read_user_config, write_user_config
 from .conversation import ConversationKeyResolver
 from .daemon import AtomCodeDaemon
 from . import anthropic_adapter, openai_adapter
@@ -73,6 +73,14 @@ def _is_local_source(request: Request, cfg: Config) -> bool:
         if value and not any(value == p or value.startswith(p + "/") for p in allowed):
             return False
     return True
+
+
+def _escape_attr(val: str) -> str:
+    """转义 HTML 属性值：防止值中的引号截断属性或注入标签结构。
+
+    统一用于所有 value="..." 拼接场景（工作目录、password、text 等）。
+    """
+    return val.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _sanitize_download_filename(name: str) -> str:
@@ -253,7 +261,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 initial = str(body["current"])
         except Exception:
             pass  # 无请求体或非 JSON 时使用默认初始目录
-        selected = await asyncio.to_thread(choose_working_directory, initial)
+        selected = await asyncio.wait_for(
+            asyncio.to_thread(choose_working_directory, initial),
+            timeout=60,
+        )
         if not selected:
             return JSONResponse({"selected": False, "working_dir": cfg.working_dir})
         return JSONResponse({"selected": True, "working_dir": selected})
@@ -324,7 +335,7 @@ def create_app(config: Config | None = None) -> FastAPI:
             return runtime[field_name]
         if field_name in env_vals:
             return env_vals[field_name]
-        val = os.environ.get(field_name, "")
+        val = environ_or_dotenv(field_name)
         if val:
             return val
         return _BUILTIN_DEFAULTS.get(field_name, "")
@@ -343,10 +354,12 @@ def create_app(config: Config | None = None) -> FastAPI:
             msg_html = f'<div style="background:#d4edda;color:#155724;padding:12px 16px;border-radius:8px;margin-bottom:20px;">{safe_msg}</div>'
 
         fields_html = ""
+        # 字段回显：token 不回显明文（防局域网主机读取/浏览器保存历史泄露），
+        # 已设置时显示空值 + 占位提示，仅在用户输入新值时覆盖。
         for field_name, label, input_type, options in _SETTING_FIELDS:
             val = _current_value(field_name, env_vals, runtime)
             if field_name == "ATOMCODE_PROXY_WORKDIR":
-                escaped_val = val.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                escaped_val = _escape_attr(val)
                 input_html = f'''
                 <div style="display:flex;gap:8px;align-items:center;">
                     <input type="text" name="{field_name}" id="working-dir-input" value="{escaped_val}"
@@ -434,7 +447,7 @@ def create_app(config: Config | None = None) -> FastAPI:
                 input_html = f'<select name="{field_name}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">{opts}</select>'
             elif input_type == "dynamic-select":
                 # 完整转义：值含 </script> 或引号时不能破坏属性/脚本块
-                escaped_val = val.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                escaped_val = _escape_attr(val)
                 input_html = f'''
                 <div id="ds_{field_name}_wrap">
                     <input type="hidden" name="{field_name}" id="ds_{field_name}_hidden" value="{escaped_val}">
@@ -492,9 +505,20 @@ def create_app(config: Config | None = None) -> FastAPI:
                 </script>
                 '''
             elif input_type == "password":
-                input_html = f'<input type="password" name="{field_name}" value="{val}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
+                if val:
+                    input_html = (
+                        f'<input type="password" name="{field_name}" value="" '
+                        f'placeholder="已设置，留空保持不变" autocomplete="new-password" '
+                        f'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
+                    )
+                else:
+                    input_html = (
+                        f'<input type="password" name="{field_name}" value="" '
+                        f'placeholder="未设置，使用内置默认值" autocomplete="new-password" '
+                        f'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
+                    )
             else:
-                input_html = f'<input type="text" name="{field_name}" value="{val}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
+                input_html = f'<input type="text" name="{field_name}" value="{_escape_attr(val)}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">'
             fields_html += f"""
             <div style="margin-bottom:16px;">
                 <label style="display:block;font-weight:600;margin-bottom:4px;color:#444;">{label}</label>
@@ -577,8 +601,14 @@ def create_app(config: Config | None = None) -> FastAPI:
 </html>"""
 
     @app.get("/settings", response_class=HTMLResponse)
-    async def settings_page() -> str:
-        """返回设置页面 HTML 表单。"""
+    async def settings_page(request: Request) -> Response:
+        """返回设置页面 HTML 表单。
+
+        与写操作一样校验请求来源：GET 也回显 daemon 连接信息，
+        host=0.0.0.0 监听时不能让局域网任意主机读取。
+        """
+        if not _is_local_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         env_vals = _read_env_file()
         return _settings_html(env_vals, runtime=_runtime_values())
 
@@ -600,6 +630,50 @@ def create_app(config: Config | None = None) -> FastAPI:
             message="<br>".join(messages),
             runtime=_runtime_values(),
         )
+
+    def _schedule_daemon_switch(app: FastAPI) -> None:
+        """后台任务：等旧 daemon 客户端所有会话空闲后执行延迟的配置切换。
+
+        设置页保存 daemon 地址/Token 时若有进行中的任务，立即 close 旧客户端
+        会终止所有客户端正在执行的模型生成与工具执行；推迟到空闲后再切换。
+        """
+        task = getattr(app.state, "daemon_switch_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def _switch_when_idle() -> None:
+            while True:
+                old = getattr(app.state, "daemon", None)
+                pending = getattr(app.state, "pending_daemon_switch", None)
+                if not pending or not isinstance(old, AtomCodeDaemon):
+                    app.state.pending_daemon_switch = None
+                    return
+                if not any(s.lock.locked() for s in old._states.values()):
+                    new_url, new_token = pending
+                    try:
+                        await old.close()
+                    except Exception as exc:
+                        log.warning("关闭旧 daemon 客户端失败: %s", exc)
+                    app.state.daemon = AtomCodeDaemon(
+                        new_url,
+                        daemon_token=new_token,
+                        default_provider=cfg.default_provider,
+                        approval_mode=cfg.approval_mode,
+                        default_working_dir=cfg.working_dir,
+                    )
+                    app.state.pending_daemon_switch = None
+                    log.info("Daemon 连接已在任务结束后切换: %s", new_url)
+                    # 同步主进程侧生命周期：停旧进程并按新配置拉起
+                    handler = getattr(app.state, "on_daemon_config_changed", None)
+                    if handler is not None:
+                        try:
+                            await asyncio.to_thread(handler, new_url)
+                        except Exception as exc:
+                            log.warning("同步 daemon 进程生命周期失败: %s", exc)
+                    return
+                await asyncio.sleep(2)
+
+        app.state.daemon_switch_task = asyncio.create_task(_switch_when_idle())
 
     async def _apply_settings(app: FastAPI, updates: dict[str, str]) -> list[str]:
         """把表单修改热更新到运行时配置，并持久化到用户配置文件 atomcode-proxy-config.json。
@@ -669,18 +743,35 @@ def create_app(config: Config | None = None) -> FastAPI:
             cfg.daemon_url = new_daemon_url
             if new_daemon_token:
                 cfg.daemon_token = new_daemon_token
+            old = app.state.daemon
+            busy = isinstance(old, AtomCodeDaemon) and any(s.lock.locked() for s in old._states.values())
             try:
-                old = app.state.daemon
-                if old is not None:
-                    await old.close()
-                app.state.daemon = AtomCodeDaemon(
-                    cfg.daemon_url,
-                    daemon_token=cfg.daemon_token,
-                    default_provider=cfg.default_provider,
-                    approval_mode=cfg.approval_mode,
-                    default_working_dir=cfg.working_dir,
-                )
-                messages.append("Daemon 连接已更新并立即生效（原有会话上下文已重置）")
+                if busy:
+                    # 有进行中的任务：立即 close 会终止所有客户端正在执行的会话，
+                    # 推迟到任务结束后再切换（期间新请求仍走旧连接）。
+                    app.state.pending_daemon_switch = (new_daemon_url, new_daemon_token or cfg.daemon_token)
+                    messages.append("检测到进行中的任务：Daemon 连接将在任务结束后自动切换（期间新请求仍走旧连接）")
+                    _schedule_daemon_switch(app)
+                else:
+                    if old is not None:
+                        await old.close()
+                    app.state.pending_daemon_switch = None
+                    app.state.daemon = AtomCodeDaemon(
+                        cfg.daemon_url,
+                        daemon_token=cfg.daemon_token,
+                        default_provider=cfg.default_provider,
+                        approval_mode=cfg.approval_mode,
+                        default_working_dir=cfg.working_dir,
+                    )
+                    messages.append("Daemon 连接已更新并立即生效（原有会话上下文已重置）")
+                    # 同步主进程侧 daemon 进程生命周期（停旧进程、按新配置拉起），
+                    # 避免看门狗下一轮另起进程后旧进程泄漏为孤儿
+                    handler = getattr(app.state, "on_daemon_config_changed", None)
+                    if handler is not None:
+                        try:
+                            await asyncio.to_thread(handler, cfg.daemon_url)
+                        except Exception as exc:
+                            log.warning("同步 daemon 进程生命周期失败: %s", exc)
             except Exception as exc:
                 log.warning("重建 daemon 客户端失败: %s", exc)
                 messages.append(f"Daemon 配置已保存，但重建连接失败: {exc}")
@@ -694,7 +785,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         # 环境变量优先级高于用户配置文件：被覆盖的项重启后会恢复环境变量值，需明确提示
         env_overridden = sorted(
-            key for key, val in persist_updates.items() if os.environ.get(key) and os.environ.get(key) != val
+            key for key, val in persist_updates.items() if environ_or_dotenv(key) and environ_or_dotenv(key) != val
         )
         if env_overridden:
             messages.append(
@@ -715,8 +806,14 @@ def create_app(config: Config | None = None) -> FastAPI:
         return messages
 
     @app.get("/", response_class=HTMLResponse)
-    async def status_page() -> str:
-        """返回 HTML 状态页面。"""
+    async def status_page(request: Request) -> Response:
+        """返回 HTML 状态页面。
+
+        同样校验请求来源：页面含 daemon 连接信息（地址/provider），
+        host=0.0.0.0 监听时不能让局域网任意主机读取。
+        """
+        if not _is_local_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         logo_b64 = _get_logo_base64()
         logo_html = ""
         if logo_b64:
@@ -882,7 +979,11 @@ def create_app(config: Config | None = None) -> FastAPI:
         var btn = document.getElementById("check-update-btn");
         if (btn) {{ btn.disabled = true; btn.textContent = "检查中..."; }}
         fetch("/api/update/check")
-            .then(function(r) {{ return r.json(); }})
+            .then(function(r) {{
+                // 502 等非 200 表示检查失败（如 GitHub 限流），不能当作"已是最新"
+                if (!r.ok) {{ throw new Error("HTTP " + r.status); }}
+                return r.json();
+            }})
             .then(function(data) {{
                 var banner = document.getElementById("update-banner");
                 var content = document.getElementById("update-banner-content");

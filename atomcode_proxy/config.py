@@ -31,7 +31,10 @@ DEFAULT_ENV_TEMPLATE = """\
 #ATOMCODE_DEFAULT_PROVIDER=AtomGit-deepseek-v4-flash
 #ATOMCODE_APPROVAL_MODE=bypass
 #ATOMCODE_PROXY_WORKDIR=
+#ATOMCODE_WORKDIR_ROOTS=
 #ATOMCODE_MODEL_ALIAS=
+#ATOMCODE_DAEMON_PATH=
+#ATOMCODE_PROXY_ENV=
 """
 
 
@@ -42,8 +45,14 @@ def _default_env_path() -> Path:
     return _PROJECT_ROOT / ".env"
 
 
+# .env 解析结果：存入独立字典而非写入 os.environ。
+# 若直接并入 os.environ，.env 会错误地优先于网页设置页保存的
+# atomcode-proxy-config.json，违背文档声明的优先级契约。
+_dotenv_values: dict[str, str] = {}
+
+
 def _load_dotenv(path: Path | None = None) -> None:
-    """轻量 .env 加载：不覆盖已存在的环境变量。
+    """轻量 .env 解析：结果写入 _dotenv_values，不触碰 os.environ。
 
     仅支持 KEY=VALUE 行、# 注释、双引号包裹的值；不处理变量展开。
     路径优先级：环境变量 ATOMCODE_PROXY_ENV > _default_env_path()。
@@ -61,12 +70,20 @@ def _load_dotenv(path: Path | None = None) -> None:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key and key not in _dotenv_values:
+            _dotenv_values[key] = value
     log.info(".env 加载完成: %s", path)
 
 
 _load_dotenv()
+
+
+def environ_or_dotenv(key: str) -> str:
+    """读取环境变量或 .env 值（环境变量优先），均无则返回空串。
+
+    供设置页提示等场景查询"最终生效的环境级配置"。
+    """
+    return os.environ.get(key) or _dotenv_values.get(key, "")
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +130,11 @@ def read_user_config() -> dict[str, str]:
 
 
 def write_user_config(updates: dict[str, str]) -> Path:
-    """把 {key: value} 合并写入用户配置文件；空值表示删除该项。返回文件路径。"""
+    """把 {key: value} 合并写入用户配置文件；空值表示删除该项。返回文件路径。
+
+    通过临时文件 + os.replace 原子替换，避免并发保存交错或写入中途
+    崩溃留下截断的 JSON。
+    """
     merged = read_user_config()
     for key, val in updates.items():
         if key not in _USER_CONFIG_KEYS:
@@ -124,7 +145,9 @@ def write_user_config(updates: dict[str, str]) -> Path:
             merged.pop(key, None)
     path = user_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
     return path
 
 
@@ -133,17 +156,18 @@ _user_config = read_user_config()
 
 
 def _cfg_value(key: str, default: str) -> str:
-    """取值优先级：系统环境变量 > atomcode-proxy-config.json（网页保存）> 内置默认值。
-
-    .env 的值在模块加载时已并入 os.environ（不覆盖已有变量），因此环境变量分支已涵盖 .env。
-    """
-    return os.environ.get(key) or _user_config.get(key) or default
+    """取值优先级：系统环境变量 > atomcode-proxy-config.json（网页保存）> .env > 内置默认值。"""
+    return os.environ.get(key) or _user_config.get(key) or _dotenv_values.get(key) or default
 
 
 def _resolve_working_dir() -> str:
-    """读取显式工作目录（环境变量 > atomcode-proxy-config.json）；未配置时返回空值，
+    """读取显式工作目录（环境变量 > atomcode-proxy-config.json > .env）；未配置时返回空值，
     由启动流程回退到用户主目录。"""
-    raw = os.environ.get("ATOMCODE_PROXY_WORKDIR") or _user_config.get("ATOMCODE_PROXY_WORKDIR", "")
+    raw = (
+        os.environ.get("ATOMCODE_PROXY_WORKDIR")
+        or _user_config.get("ATOMCODE_PROXY_WORKDIR", "")
+        or _dotenv_values.get("ATOMCODE_PROXY_WORKDIR", "")
+    )
     return raw.strip()
 
 
@@ -152,7 +176,7 @@ def _resolve_workdir_roots() -> list[str]:
 
     仅保留已存在的绝对目录；配置后请求级工作目录必须位于任一允许根内。
     """
-    raw = os.environ.get("ATOMCODE_WORKDIR_ROOTS", "")
+    raw = os.environ.get("ATOMCODE_WORKDIR_ROOTS") or _dotenv_values.get("ATOMCODE_WORKDIR_ROOTS", "")
     roots: list[str] = []
     for item in raw.split(","):
         normalized = normalize_working_directory(item)
@@ -163,11 +187,21 @@ def _resolve_workdir_roots() -> list[str]:
     return roots
 
 
+def _parse_port(raw: str) -> int:
+    """解析端口配置：非法值（如 .env 手写 8765x）回退默认端口并告警，
+    避免 Config 构造直接抛 ValueError 导致冻结 exe 静默崩溃。"""
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("ATOMCODE_PROXY_PORT 无效: %r，回退默认 8765", raw)
+        return 8765
+
+
 @dataclass
 class Config:
     """运行时可变的配置对象：网页保存的热更新直接改字段即可。"""
     host: str = field(default_factory=lambda: _cfg_value("ATOMCODE_PROXY_HOST", "127.0.0.1"))
-    port: int = field(default_factory=lambda: int(_cfg_value("ATOMCODE_PROXY_PORT", "8765")))
+    port: int = field(default_factory=lambda: _parse_port(_cfg_value("ATOMCODE_PROXY_PORT", "8765")))
 
     daemon_url: str = field(default_factory=lambda: _cfg_value("ATOMCODE_DAEMON_URL", "http://127.0.0.1:13456"))
     daemon_token: str = field(default_factory=lambda: _cfg_value("ATOMCODE_DAEMON_TOKEN", "atomcode_webui"))
@@ -186,7 +220,11 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         aliases: dict[str, str] = {}
-        raw = os.environ.get("ATOMCODE_MODEL_ALIAS") or _user_config.get("ATOMCODE_MODEL_ALIAS", "")
+        raw = (
+            os.environ.get("ATOMCODE_MODEL_ALIAS")
+            or _user_config.get("ATOMCODE_MODEL_ALIAS", "")
+            or _dotenv_values.get("ATOMCODE_MODEL_ALIAS", "")
+        )
         for pair in raw.split(","):
             if "=" in pair:
                 k, v = pair.split("=", 1)

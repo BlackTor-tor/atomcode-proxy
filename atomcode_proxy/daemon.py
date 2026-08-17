@@ -31,6 +31,17 @@ MAX_CONVERSATIONS = 256
 _PROVIDERS_CACHE_TTL = 300.0
 
 
+def _wrap_httpx_errors(exc: Exception) -> AtomCodeDaemonError:
+    """把 daemon 不可达等网络层异常包装为 502 语义的 AtomCodeDaemonError。
+
+    适配器只捕获 AtomCodeDaemonError；若 httpx 连接异常直接穿透，
+    非流式会变裸 500、流式会断流无 [DONE]，破坏 502 upstream_error 契约。
+    """
+    if isinstance(exc, AtomCodeDaemonError):
+        return exc
+    return AtomCodeDaemonError(f"daemon unreachable: {exc}", 502)
+
+
 class AtomCodeDaemonError(RuntimeError):
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
@@ -98,7 +109,10 @@ class AtomCodeDaemon:
         await self._client.aclose()
 
     async def _create_session(self, working_dir: str) -> str:
-        resp = await self._client.post("/sessions", json={"working_dir": working_dir})
+        try:
+            resp = await self._client.post("/sessions", json={"working_dir": working_dir})
+        except httpx.HTTPError as exc:
+            raise _wrap_httpx_errors(exc) from exc
         if resp.status_code < 200 or resp.status_code >= 300:
             raise AtomCodeDaemonError(f"create session failed: {resp.status_code} {resp.text[:300]}", resp.status_code)
         data = resp.json()
@@ -110,10 +124,13 @@ class AtomCodeDaemon:
     async def _import_messages(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         if not messages:
             return
-        resp = await self._client.post(
-            f"/sessions/{session_id}/messages",
-            json={"messages": messages},
-        )
+        try:
+            resp = await self._client.post(
+                f"/sessions/{session_id}/messages",
+                json={"messages": messages},
+            )
+        except httpx.HTTPError as exc:
+            raise _wrap_httpx_errors(exc) from exc
         if resp.status_code < 200 or resp.status_code >= 300:
             raise AtomCodeDaemonError(
                 f"import session messages failed: {resp.status_code} {resp.text[:300]}",
@@ -188,7 +205,10 @@ class AtomCodeDaemon:
     # ---------- 模型列表 ----------
 
     async def list_models(self) -> list[dict[str, Any]]:
-        resp = await self._client.get("/models")
+        try:
+            resp = await self._client.get("/models")
+        except httpx.HTTPError as exc:
+            raise _wrap_httpx_errors(exc) from exc
         if resp.status_code != 200:
             raise AtomCodeDaemonError(f"list models failed: {resp.status_code} {resp.text[:300]}")
         return resp.json()
@@ -203,7 +223,7 @@ class AtomCodeDaemon:
             return self._providers_cache
         try:
             models = await self.list_models()
-        except AtomCodeDaemonError as exc:
+        except (AtomCodeDaemonError, httpx.HTTPError) as exc:
             log.warning("获取 provider 名单失败，模型名解析回退透传: %s", exc)
             return set()
         self._providers_cache = {m.get("provider", "") for m in models if m.get("provider")}
@@ -307,7 +327,33 @@ class AtomCodeDaemon:
         provider: str | None,
         approval_mode: str | None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """底层 /chat 调用：不做 session 管理，仅解析 SSE。"""
+        """底层 /chat 调用：不做 session 管理，仅解析 SSE。
+
+        httpx 网络层异常（daemon 宕机/重启窗口）统一包装为 502 语义，
+        避免生成器内异常直接穿透到适配器造成断流。
+        """
+        try:
+            async for ev in self._chat_stream_raw_inner(
+                message,
+                session_id=session_id,
+                working_dir=working_dir,
+                provider=provider,
+                approval_mode=approval_mode,
+            ):
+                yield ev
+        except httpx.HTTPError as exc:
+            raise _wrap_httpx_errors(exc) from exc
+
+    async def _chat_stream_raw_inner(
+        self,
+        message: str,
+        *,
+        session_id: str,
+        working_dir: str,
+        provider: str | None,
+        approval_mode: str | None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """_chat_stream_raw 的未包装实现（网络异常直接抛出）。"""
         request_id = str(uuid.uuid4())
         body = {
             "message": message,

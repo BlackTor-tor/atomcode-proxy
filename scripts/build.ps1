@@ -26,14 +26,15 @@ function Get-VersionFromInit {
 }
 
 # 1) Optional: overwrite version
+$OriginalInitContent = $null
 if ($Version -ne "") {
-    Write-Host "[1/5] Setting version $Version in atomcode_proxy/__init__.py"
-    $content = Get-Content $InitPy -Raw -Encoding UTF8
-    if ($content -notmatch '__version__\s*=\s*"[^"]+"') {
+    Write-Host "[1/5] Setting version $Version in atomcode_proxy/__init__.py (restored after build)"
+    $OriginalInitContent = [System.IO.File]::ReadAllText($InitPy)
+    if ($OriginalInitContent -notmatch '__version__\s*=\s*"[^"]+"') {
         throw "No __version__ assignment found in atomcode_proxy/__init__.py, refusing to overwrite"
     }
-    $updated = $content -replace '__version__\s*=\s*"[^"]+"', ('__version__ = "' + $Version + '"')
-    Set-Content -Path $InitPy -Value $updated -Encoding UTF8 -NoNewline
+    $updated = $OriginalInitContent -replace '__version__\s*=\s*"[^"]+"', ('__version__ = "' + $Version + '"')
+    [System.IO.File]::WriteAllText($InitPy, $updated)
 } else {
     Write-Host "[1/5] No -Version given, using existing version from __init__.py"
 }
@@ -89,4 +90,11 @@ Get-ChildItem $ReleaseDir | ForEach-Object {
     $sizeKB = [math]::Round($_.Length / 1KB, 1)
     $sizeMB = [math]::Round($_.Length / 1MB, 2)
     Write-Host ("      {0}  ({1} MB / {2} KB)" -f $_.FullName, $sizeMB, $sizeKB)
+}
+
+# 6) Restore the original __version__ so a local build does not leave
+#    a dirty git working tree (CI rewrites the version itself instead).
+if ($null -ne $OriginalInitContent) {
+    [System.IO.File]::WriteAllText($InitPy, $OriginalInitContent)
+    Write-Host "[6/6] Restored original __init__.py (version $BuildVersion was only injected for this build)"
 }

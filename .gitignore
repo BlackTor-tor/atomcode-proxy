@@ -18,5 +18,8 @@ build/
 dist/
 release/
 
+# pytest 临时目录（Windows 下 atexit 清理失败时可能残留）
+.pytest_tmp_alt/
+
 # Windows 图标缓存垃圾目录（tkinter/托盘触发生成）
 %SystemDrive%/

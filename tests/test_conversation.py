@@ -1,6 +1,8 @@
 from atomcode_proxy.conversation import (
     ConversationKeyResolver,
+    explicit_conversation_id,
     normalize_messages,
+    previous_response_id,
     request_working_directory,
 )
 
@@ -133,6 +135,54 @@ def test_request_working_directory_rejects_override_outside_roots(tmp_path):
 
     assert path == str(default_dir.resolve())
     assert source == "default"
+
+
+def test_request_working_directory_prefers_body_over_query(tmp_path):
+    """优先级契约：header > body/metadata > query；body 与 query 同时出现时取 body。"""
+    body_dir = tmp_path / "body"
+    query_dir = tmp_path / "query"
+    body_dir.mkdir()
+    query_dir.mkdir()
+
+    path, source = request_working_directory(
+        {},
+        {"working_dir": str(body_dir)},
+        "C:/fallback",
+        {"working_dir": str(query_dir)},
+    )
+
+    assert path == str(body_dir.resolve())
+    assert source == "body"
+
+
+def test_resolver_maps_previous_response_id_back_to_same_conversation():
+    """previous_response_id（resp_ 前缀）应映射回登记时的同一逻辑会话。"""
+    resolver = ConversationKeyResolver()
+    scope = "codex"
+
+    key = resolver.resolve(scope, [{"role": "user", "content": "first"}])
+    resolver.remember_response(scope, "resp_abc123", key)
+
+    assert resolver.resolve(scope, [{"role": "user", "content": "second"}], "resp_abc123") == key
+
+
+def test_resolver_falls_back_to_prefix_when_response_mapping_missing():
+    """映射丢失（如代理重启）时回退历史前缀匹配。"""
+    resolver = ConversationKeyResolver()
+    scope = "codex"
+    messages = [{"role": "user", "content": "first"}]
+
+    key = resolver.resolve(scope, messages)
+    resolver.remember(scope, key, messages)
+
+    assert resolver.resolve(scope, messages, "resp_unknown") == key
+
+
+def test_explicit_conversation_id_ignores_previous_response_id():
+    """previous_response_id 不应被当作显式会话 ID（需经映射解析）。"""
+    assert explicit_conversation_id({}, {"previous_response_id": "resp_1"}) is None
+    assert previous_response_id({"previous_response_id": "resp_1"}) == "resp_1"
+    assert previous_response_id({}) is None
 
 
 def test_request_working_directory_rejects_query_override_outside_roots(tmp_path):

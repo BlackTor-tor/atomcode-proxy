@@ -94,6 +94,18 @@ class ConversationKeyResolver:
         self.max_entries = max_entries
         self.max_messages = max_messages
         self._entries: dict[str, list[_ConversationFingerprint]] = {}
+        # response_id -> conversation key 映射（FIFO 淘汰，防止无限增长）：
+        # /v1/responses 每轮生成新的 resp_<hex>，客户端下轮通过
+        # previous_response_id 引用，需要映射回原会话以复用 daemon session。
+        self._response_keys: dict[tuple[str, str], str] = {}
+        self._response_order: list[tuple[str, str]] = []
+
+    def _lookup_by_prefix(self, scope: str, normalized_history: list[dict[str, str]]) -> str | None:
+        entries = self._entries.setdefault(scope, [])
+        matches = [entry for entry in entries if _is_prefix(entry.last_request, normalized_history)]
+        if matches:
+            return max(matches, key=lambda entry: (len(entry.last_request), entry.updated_at)).key
+        return None
 
     def resolve(
         self,
@@ -102,15 +114,29 @@ class ConversationKeyResolver:
         explicit_id: str | None = None,
     ) -> str:
         if explicit_id:
+            if explicit_id.startswith("resp_"):
+                # previous_response_id：优先查映射复用同一会话；
+                # 映射缺失（如代理重启）时回退前缀匹配或生成新会话
+                mapped = self._response_keys.get((scope, explicit_id))
+                if mapped:
+                    return mapped
+                key = self._lookup_by_prefix(scope, normalize_messages(history))
+                return key or f"generated:{scope}:{uuid.uuid4().hex}"
             return f"explicit:{scope}:{explicit_id[:256]}"
 
-        normalized_history = normalize_messages(history)
-        entries = self._entries.setdefault(scope, [])
-        matches = [entry for entry in entries if _is_prefix(entry.last_request, normalized_history)]
-        if matches:
-            return max(matches, key=lambda entry: (len(entry.last_request), entry.updated_at)).key
+        key = self._lookup_by_prefix(scope, normalize_messages(history))
+        return key or f"generated:{scope}:{uuid.uuid4().hex}"
 
-        return f"generated:{scope}:{uuid.uuid4().hex}"
+    def remember_response(self, scope: str, response_id: str, key: str) -> None:
+        """记录 response_id 与逻辑会话的映射，供下轮 previous_response_id 解析。"""
+        pair = (scope, response_id)
+        self._response_keys[pair] = key
+        self._response_order.append(pair)
+        overflow = len(self._response_order) - self.max_entries
+        if overflow > 0:
+            for old in self._response_order[:overflow]:
+                self._response_keys.pop(old, None)
+            del self._response_order[:overflow]
 
     def remember(self, scope: str, key: str, messages: list[dict[str, Any]]) -> None:
         # 只保留开头 max_messages 条：前缀匹配只需开头一致，截断后仍是
@@ -146,7 +172,7 @@ def explicit_conversation_id(headers: Mapping[str, str], body: Mapping[str, Any]
         if value and value.strip():
             return value.strip()
 
-    for name in ("conversation_id", "conversationId", "session_id", "sessionId", "conversation", "previous_response_id"):
+    for name in ("conversation_id", "conversationId", "session_id", "sessionId", "conversation"):
         value = body.get(name)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -157,6 +183,18 @@ def explicit_conversation_id(headers: Mapping[str, str], body: Mapping[str, Any]
             value = metadata.get(name)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+    return None
+
+
+def previous_response_id(body: Mapping[str, Any]) -> str | None:
+    """提取 Responses API 的 previous_response_id（Codex 多轮会话引用）。
+
+    单独处理而非当作会话 ID：代理每轮生成新的 resp_<hex>，
+    需经 ConversationKeyResolver.remember_response 映射回原会话。
+    """
+    value = body.get("previous_response_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return None
 
 
@@ -177,7 +215,10 @@ def request_working_directory(
     query: Mapping[str, str] | None = None,
     allowed_roots: Sequence[str] | None = None,
 ) -> tuple[str | None, str]:
-    """按请求覆盖、URL 参数、协议字段、默认值解析工作目录。
+    """按请求覆盖、协议字段、URL 参数、默认值解析工作目录。
+
+    优先级（与 README 声明一致）：header > 请求 JSON body/metadata >
+    URL 查询参数 > 默认目录。
 
     安全围栏：配置 allowed_roots（ATOMCODE_WORKDIR_ROOTS）后，请求级目录
     必须位于任一允许根内，越界覆盖会被忽略并回退默认目录；未配置时不限制。
@@ -214,11 +255,7 @@ def request_working_directory(
         if selected:
             return selected, "header"
 
-    for name in ("working_dir", "working_directory", "cwd", "workspace_path"):
-        selected = _candidate((query or {}).get(name), "query")
-        if selected:
-            return selected, "query"
-
+    # 请求 JSON body / metadata 优先于 URL 查询参数（与 README 声明一致）
     for name in ("working_dir", "workingDir", "working_directory", "cwd", "workspace_path", "workspace"):
         value = body.get(name)
         if isinstance(value, str):
@@ -234,5 +271,10 @@ def request_working_directory(
                 selected = _candidate(value, "metadata")
                 if selected:
                     return selected, "metadata"
+
+    for name in ("working_dir", "working_directory", "cwd", "workspace_path"):
+        selected = _candidate((query or {}).get(name), "query")
+        if selected:
+            return selected, "query"
 
     return normalize_working_directory(default), "default"

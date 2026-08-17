@@ -1,13 +1,15 @@
-"""Anthropic 兼容适配器：/v1/messages (+ /v1/models)。
+"""Anthropic 兼容适配器：/v1/messages。
 
 Anthropic 流式事件序列（message_start -> content_block_start -> content_block_delta -> ... -> message_stop）
 在此被构造为对 Cursor/Claude Code 等客户端兼容的格式。
+
+注：模型列表统一由 OpenAI 适配器的 GET /v1/models 提供（先注册先生效），
+Anthropic 客户端拿到的模型列表为 OpenAI 格式（依赖 data[].id 兼容）。
 """
 from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -253,9 +255,29 @@ async def _messages_to_anthropic_object(
     }
 
 
+async def _parse_json_body(request: Request) -> dict[str, Any] | JSONResponse:
+    """解析请求 JSON 体；非法 JSON 或非对象返回 400 而非落为 500。"""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": "invalid JSON body"}},
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": "request body must be a JSON object"}},
+        )
+    return body
+
+
 @router.post("/v1/messages", response_model=None)
 async def messages(request: Request) -> StreamingResponse | JSONResponse:
-    body = await request.json()
+    parsed = await _parse_json_body(request)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    body: dict[str, Any] = parsed
     model_raw = body.get("model")
     daemon: AtomCodeDaemon = request.app.state.daemon
     cfg = request.app.state.config
@@ -320,20 +342,3 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             status_code=502,
             content={"type": "error", "error": {"type": "api_error", "message": str(e)}},
         )
-
-
-@router.get("/v1/models")
-async def list_models(request: Request) -> JSONResponse:
-    daemon: AtomCodeDaemon = request.app.state.daemon
-    try:
-        models = await daemon.list_models()
-    except AtomCodeDaemonError as e:
-        return JSONResponse(
-            status_code=502,
-            content={"type": "error", "error": {"type": "api_error", "message": str(e)}},
-        )
-    data = [
-        {"id": m.get("provider"), "display_name": m.get("provider"), "created_at": int(time.time())}
-        for m in models
-    ]
-    return JSONResponse({"data": data, "has_more": False, "first_id": data[0]["id"] if data else None, "last_id": data[-1]["id"] if data else None})

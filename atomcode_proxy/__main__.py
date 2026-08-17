@@ -16,7 +16,7 @@ import uvicorn
 
 from . import __version__
 from .app import create_app
-from .config import Config, DEFAULT_ENV_TEMPLATE, _default_env_path
+from .config import Config, DEFAULT_ENV_TEMPLATE, _default_env_path, _dotenv_values
 from .tray import SystemTray
 from .workdir import normalize_working_directory
 
@@ -27,9 +27,23 @@ log = logging.getLogger("atomcode_proxy.main")
 # 端口预检
 # ---------------------------------------------------------------------------
 
+def _probe_host(host: str) -> str:
+    """通配监听地址（0.0.0.0/::）下，就绪探测改用回环地址。
+
+    Windows 上 socket.create_connection(("0.0.0.0", port)) 会抛
+    WinError 10049（WSAEADDRNOTAVAIL），直接探测通配地址必失败。
+    """
+    return "127.0.0.1" if host in ("0.0.0.0", "::") else host
+
+
 def _check_port_available(host: str, port: int) -> bool:
-    """端口占用预检：bind 成功后立即 close 释放。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    """端口占用预检：bind 成功后立即 close 释放。
+
+    按 host 字面量选择地址族：IPv6 地址用 AF_INET6，否则 AF_INET，
+    避免 IPv6 监听（如 ::）被 AF_INET bind 误判为端口占用。
+    """
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, port))
             return True
@@ -86,8 +100,8 @@ def _find_daemon_executable() -> Path | None:
     2. %LOCALAPPDATA%\\AtomCode\\atomcode.exe（标准安装位置）
     3. C:\\Program Files\\AtomCode\\atomcode.exe
     """
-    # 1. 环境变量
-    env_path = os.environ.get("ATOMCODE_DAEMON_PATH")
+    # 1. 环境变量（含 .env 解析值）
+    env_path = os.environ.get("ATOMCODE_DAEMON_PATH") or _dotenv_values.get("ATOMCODE_DAEMON_PATH", "")
     if env_path:
         p = Path(env_path)
         if p.is_file():
@@ -173,6 +187,10 @@ def _daemon_watchdog(
         # 等待 60 秒，期间若 stop_event 被 set 则立即退出
         if stop_event.wait(timeout=60):
             break
+        # 代理服务自身存活检查：uvicorn 运行期意外崩溃时端口会关闭，
+        # 仅记录告警日志（托盘已无法恢复，至少留下排查线索）
+        if not _is_port_listening(_probe_host(cfg.host), cfg.port):
+            log.error("代理服务端口 %s:%s 无响应：HTTP 服务可能已崩溃，请检查日志或重启", cfg.host, cfg.port)
         # 检测 daemon 是否仍在运行
         if _is_daemon_running(cfg.daemon_url):
             continue
@@ -186,9 +204,12 @@ def _daemon_watchdog(
         if new_proc is not None:
             log.info("daemon 已重启 (PID: %d)", new_proc.pid)
             with daemon_proc_lock:
+                old_proc = daemon_proc_holder[0]
                 daemon_proc_holder[0] = new_proc
-            # 等待新 daemon 就绪
-            time.sleep(2.0)
+            # 锁外停止旧进程：避免长时间持锁阻塞主线程退出路径
+            _stop_daemon(old_proc)
+            # 等待新 daemon 就绪；stop_event 响应式等待，退出时立即返回
+            stop_event.wait(2.0)
         else:
             log.warning("daemon 重启失败，将在下次检测时重试")
     log.info("daemon 看门狗已停止")
@@ -199,19 +220,21 @@ def _daemon_watchdog(
 # ---------------------------------------------------------------------------
 
 def _get_log_directory() -> Path:
-    """获取日志目录：冻结模式取 exe 同级目录，开发模式取项目根目录。"""
+    """获取日志目录：冻结模式取 %APPDATA%\\atomcode-proxy\\logs（exe 旁不生成文件，
+    且 exe 可能部署在 Program Files 等不可写目录），开发模式取项目根目录。"""
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "logs"
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "atomcode-proxy" / "logs"
     return Path(__file__).resolve().parent.parent / "logs"
 
 
 def _setup_logging(cfg: Config) -> str:
     """配置日志：冻结模式只输出到文件，开发模式同时输出到控制台和文件。
 
-    返回日志文件路径。
+    日志目录不可写时降级（仅告警不崩溃），避免无写权限目录下
+    冻结 exe 静默退出。返回日志文件路径。
     """
     log_dir = _get_log_directory()
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "atomcode-proxy.log"
 
     # 根日志配置
@@ -219,15 +242,19 @@ def _setup_logging(cfg: Config) -> str:
     root_logger.setLevel(logging.INFO)
 
     # 文件处理器：1MB x 3 备份
-    file_handler = RotatingFileHandler(
-        log_path,
-        maxBytes=1024 * 1024,  # 1MB
-        backupCount=3,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-    root_logger.addHandler(file_handler)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path,
+            maxBytes=1024 * 1024,  # 1MB
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        root_logger.addHandler(file_handler)
+    except OSError as exc:
+        log.warning("日志文件不可写，跳过文件日志: %s", exc)
 
     # 开发模式：同时输出到控制台
     if not getattr(sys, "frozen", False):
@@ -244,16 +271,37 @@ def _setup_logging(cfg: Config) -> str:
 # ---------------------------------------------------------------------------
 
 def _init_config() -> None:
-    """生成默认 .env 配置文件供用户自定义。"""
+    """生成默认 .env 配置文件供用户自定义。
+
+    冻结 exe（console=False）下 stdout 重定向到 devnull，print 无可见输出：
+    提示写入日志文件，并用资源管理器打开 .env 所在目录作为反馈。
+    """
     env_path = _default_env_path()
-    if env_path.exists():
-        print(f"配置文件已存在: {env_path}")
-        print("如需重新生成，请先删除该文件。")
+    try:
+        if env_path.exists():
+            lines = [f"配置文件已存在: {env_path}", "如需重新生成，请先删除该文件。"]
+        else:
+            env_path.write_text(DEFAULT_ENV_TEMPLATE, encoding="utf-8")
+            lines = [
+                f"已生成配置文件模板: {env_path}",
+                "所有配置项均有内置默认值，无需修改即可直接运行。",
+                "如需自定义，取消注释对应行并修改值即可。",
+            ]
+    except OSError as exc:
+        lines = [f"生成配置文件失败: {exc}（当前目录可能不可写）"]
+    if getattr(sys, "frozen", False):
+        try:
+            log_dir = _get_log_directory()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with open(log_dir / "atomcode-proxy.log", "a", encoding="utf-8") as f:
+                f.write("\n".join(f"[init-config] {ln}" for ln in lines) + "\n")
+            if sys.platform == "win32":
+                os.startfile(str(env_path.parent))
+        except OSError as exc:
+            log.warning("写入 init-config 日志失败: %s", exc)
         return
-    env_path.write_text(DEFAULT_ENV_TEMPLATE, encoding="utf-8")
-    print(f"已生成配置文件模板: {env_path}")
-    print("所有配置项均有内置默认值，无需修改即可直接运行。")
-    print("如需自定义，取消注释对应行并修改值即可。")
+    for ln in lines:
+        print(ln)
 
 
 def _ensure_working_directory(cfg: Config) -> None:
@@ -354,18 +402,28 @@ def main() -> None:
 
     # 等待服务就绪（最多 10 秒）
     server_ready = False
+    probe_host = _probe_host(cfg.host)
     for _ in range(40):
         time.sleep(0.25)
         if server_error[0] is not None:
             break
-        if _is_port_listening(cfg.host, cfg.port):
+        if _is_port_listening(probe_host, cfg.port):
             server_ready = True
             break
+
+    def _cleanup_on_startup_failure() -> None:
+        """启动失败路径统一清理：停止看门狗并终止已拉起的 daemon，避免孤儿进程。"""
+        watchdog_stop.set()
+        watchdog_thread.join(timeout=5)
+        with daemon_proc_lock:
+            _stop_daemon(daemon_proc_holder[0])
+            daemon_proc_holder[0] = None
 
     if server_error[0] is not None:
         log.error("服务启动失败: %s", server_error[0])
         print(f"[错误] 服务启动失败: {server_error[0]}")
         print("请检查日志获取详细信息。")
+        _cleanup_on_startup_failure()
         if not getattr(sys, "frozen", False):
             input("按回车键退出...")
         sys.exit(1)
@@ -373,11 +431,39 @@ def main() -> None:
     if not server_ready:
         log.error("服务启动超时（等待 10 秒后仍无法连接）")
         print(f"[错误] 服务启动超时，无法监听 {cfg.host}:{cfg.port}")
+        _cleanup_on_startup_failure()
         if not getattr(sys, "frozen", False):
             input("按回车键退出...")
         sys.exit(1)
 
     log.info("服务已就绪: http://%s:%s", cfg.host, cfg.port)
+
+    # --- 注册 daemon 配置热更新回调 ---
+    # 设置页修改 ATOMCODE_DAEMON_URL 后，_apply_settings 会通过该回调同步
+    # 主进程侧的进程生命周期状态：停掉我们拉起的旧 daemon、按新配置拉起，
+    # 避免看门狗下一轮用新 URL 判定旧 daemon 失效后另起进程，导致旧进程
+    # 被 holder 覆盖而泄漏为孤儿。
+    def _on_daemon_config_changed(new_url: str) -> None:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(new_url)
+        host = (parsed.hostname or "127.0.0.1").lower()
+        port = parsed.port or 13456
+        with daemon_proc_lock:
+            old_proc = daemon_proc_holder[0]
+            daemon_proc_holder[0] = None
+        _stop_daemon(old_proc)
+        if host in ("127.0.0.1", "localhost", "::1"):
+            exe = _find_daemon_executable()
+            if exe is not None and not _is_daemon_running(new_url):
+                new_proc = _start_daemon(exe, port)
+                if new_proc is not None:
+                    with daemon_proc_lock:
+                        _stop_daemon(daemon_proc_holder[0])
+                        daemon_proc_holder[0] = new_proc
+                    log.info("daemon 已按新配置拉起 (PID: %d)", new_proc.pid)
+
+    app.state.on_daemon_config_changed = _on_daemon_config_changed
 
     # --- 自动打开浏览器 ---
     status_url = f"http://{cfg.host}:{cfg.port}/"
@@ -393,8 +479,13 @@ def main() -> None:
         server_thread.join(timeout=10)
         watchdog_stop.set()
         watchdog_thread.join(timeout=5)
+        if watchdog_thread.is_alive():
+            # 看门狗可能正处于重启路径（spawn 新进程后写 holder 的窗口），
+            # 再等一轮确保 holder 已写入最终值，避免漏停刚拉起的进程。
+            watchdog_thread.join(timeout=5)
         with daemon_proc_lock:
             _stop_daemon(daemon_proc_holder[0])
+            daemon_proc_holder[0] = None
         log.info("服务已停止")
 
     tray = SystemTray(cfg.host, cfg.port, log_path)

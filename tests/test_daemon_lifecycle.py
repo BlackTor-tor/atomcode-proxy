@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from atomcode_proxy.daemon import AtomCodeDaemon
+from atomcode_proxy.daemon import AtomCodeDaemon, SessionBusyError
 
 
 class FakeResponse:
@@ -33,6 +33,91 @@ class NoModelsClient(FakeClient):
 
     async def get(self, path, **kwargs):
         return FakeResponse(status_code=500)
+
+
+class CountingClient(FakeClient):
+    """每次 /sessions 返回递增的 session_id。"""
+
+    def __init__(self):
+        super().__init__()
+        self._next_id = 0
+
+    async def post(self, path, **kwargs):
+        self.posts.append((path, kwargs))
+        if path == "/sessions":
+            self._next_id += 1
+            return FakeResponse(payload={"session_id": f"session-{self._next_id}"})
+        return FakeResponse()
+
+
+def test_chat_retries_once_on_session_busy_409():
+    """daemon 返回 409（session busy）时应 stop 旧 session、重建并重试一次。"""
+
+    async def run():
+        daemon = AtomCodeDaemon()
+        client = CountingClient()
+        daemon._client = client
+
+        first = True
+
+        async def flaky_stream(*args, **kwargs):
+            nonlocal first
+            if first:
+                first = False
+                raise SessionBusyError("session-1")
+            yield {"type": "done", "stop_reason": "stopped"}
+
+        daemon._chat_stream_raw = flaky_stream
+
+        out = []
+        async for ev in daemon.chat_with_session(
+            "hi", working_dir="F:/workspace", conversation_key="conversation-1"
+        ):
+            out.append(ev)
+
+        assert any(e.get("type") == "done" for e in out)
+        # 409 后：stop 旧 session + 重建（第二次 /sessions）
+        sessions = [entry for entry in client.posts if entry[0] == "/sessions"]
+        stops = [entry for entry in client.posts if entry[0] == "/chat/stop"]
+        assert len(sessions) == 2
+        assert len(stops) >= 1
+
+    asyncio.run(run())
+
+
+def test_chat_retry_raises_after_second_409():
+    """连续两次 409 时不应无限重试，应浮出错误。"""
+
+    async def run():
+        daemon = AtomCodeDaemon()
+        client = CountingClient()
+        daemon._client = client
+
+        async def always_busy(*args, **kwargs):
+            if False:
+                yield {}
+            raise SessionBusyError("session-busy")
+
+        daemon._chat_stream_raw = always_busy
+
+        async def consume():
+            async for _ in daemon.chat_with_session(
+                "hi", working_dir="F:/workspace", conversation_key="conversation-1"
+            ):
+                pass
+
+        try:
+            await consume()
+        except SessionBusyError:
+            pass
+        else:
+            raise AssertionError("第二次 409 应抛出 SessionBusyError")
+
+        # 只重试一次：/sessions 恰好两次（首次 + 一次重试）
+        sessions = [entry for entry in client.posts if entry[0] == "/sessions"]
+        assert len(sessions) == 2
+
+    asyncio.run(run())
 
 
 def test_stop_chat_posts_session_id_to_daemon():

@@ -33,13 +33,14 @@ flowchart LR
 4. 程序自动打开浏览器显示状态页面，系统托盘图标提供以下功能：
    - **打开状态页面**：查看服务状态、daemon 连接信息、客户端接入指南
    - **打开设置页面**：在浏览器中修改端口、provider、工作目录等配置，保存后立即生效并持久化到用户目录的 `atomcode-proxy-config.json`（监听地址/端口需重启生效）
+   - **检查更新**：打开状态页面并自动触发一次更新检查
    - **显示日志**：用默认程序打开运行日志文件
    - **退出**：停止所有服务并关闭程序
 5. 点击托盘“退出”即完全关闭（exe 退出时会自动关闭它启动的 daemon）。
 
-> 💡 程序不会自动生成任何配置文件：设置页保存的配置存放在用户目录（`%APPDATA%\atomcode-proxy\atomcode-proxy-config.json`）。高级用户也可在 exe 旁创建 `.env` 文件自定义配置（存在才会读取，程序不会写入它），运行 `atomcode-proxy.exe --init-config` 可生成模板。
+> 💡 程序不会自动生成任何配置文件：设置页保存的配置存放在用户目录（`%APPDATA%\atomcode-proxy\atomcode-proxy-config.json`）。高级用户也可在 exe 旁创建 `.env` 文件自定义配置（存在才会读取，程序不会写入它），运行 `atomcode-proxy.exe --init-config` 可生成模板；exe 无控制台窗口，生成后会用资源管理器打开 `.env` 所在目录作为反馈，提示同时写入日志。
 >
-> 📝 日志文件保存在 `logs/atomcode-proxy.log`（exe 同级目录），可通过托盘菜单直接查看。
+> 📝 日志文件保存在 `%APPDATA%\atomcode-proxy\logs\atomcode-proxy.log`（开发模式为项目根目录 `logs/`），可通过托盘菜单直接查看。
 
 主要配置项：
 
@@ -117,6 +118,8 @@ python run.py
 | `ATOMCODE_PROXY_WORKDIR` | 用户主目录 | daemon 默认工作目录；可在设置页修改，请求可用 header、body 或 URL 参数覆盖 |
 | `ATOMCODE_WORKDIR_ROOTS` | 空（不限制） | 安全围栏：逗号分隔的允许根目录；配置后请求级目录必须位于任一允许根内，越界覆盖会被忽略并回退默认目录 |
 | `ATOMCODE_MODEL_ALIAS` | 空 | 模型别名，逗号分隔 `k=v`，如 `gpt-4o=AtomGit-deepseek-v4-flash` |
+| `ATOMCODE_DAEMON_PATH` | 自动查找 | AtomCode daemon（atomcode.exe）路径；仅在自动查找失败时指定 |
+| `ATOMCODE_PROXY_ENV` | 自动定位 | 指定 `.env` 文件路径（默认 exe 旁或项目根目录） |
 
 `.env` 加载在 `config.py` 模块导入时完成，无需额外依赖（自带轻量解析，仅支持 `KEY=VALUE`、`#` 注释、引号包裹值）。
 
@@ -240,7 +243,7 @@ Cursor、Codex CLI、Claude Code、Cline 等无法发送自定义 header 时，�
 
 - OpenAI/Anthropic `messages` 与 Responses `input` 的当前 prompt 发给 daemon；首次建立或恢复 session 时，之前的完整消息历史会写回 daemon。
 - 未知模型名（如 `claude-*`/`gpt-*`）不在 daemon provider 名单时自动回退默认 provider；daemon 返回的 error 事件会以 502 或错误文本浮出，不再静默丢弃。
-- `reasoning` 事件映射为 OpenAI 的 `reasoning_content`（DeepSeek 风格）；Anthropic 端忽略 reasoning 只传正文。
+- `reasoning` 事件映射为 OpenAI 的 `reasoning_content`（DeepSeek 风格）；Anthropic 端映射为 `thinking` block（流式为 `content_block_delta` 的 `thinking_delta`，非流式为 `thinking` 内容块，置于 text 之前）。
 - `text` 事件按 8 字符切块模拟流式输出。
 - 工具调用：daemon 处于 `bypass` 模式自行执行工具，代理不做透传。
 
@@ -250,9 +253,14 @@ Cursor、Codex CLI、Claude Code、Cline 等无法发送自定义 header 时，�
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI 对话（stream 与非 stream） |
 | POST | `/v1/responses` | OpenAI Responses API，Codex CLI 默认协议（stream 与非 stream，文本子集） |
-| GET | `/v1/models` | 模型列表（OpenAI 格式） |
+| GET | `/v1/models` | 模型列表（OpenAI 格式；Anthropic 客户端同样返回该格式，依赖 `data[].id` 兼容） |
 | POST | `/v1/messages` | Anthropic 对话（stream 与非 stream） |
 | GET | `/health` | 健康检查 |
+| GET | `/`、`GET/POST /settings` | 状态页面与设置页面（仅接受本机页面来源） |
+| GET | `/version`、`/api/models` | 版本信息；模型/Provider 列表（供设置页与状态页） |
+| GET | `/api/update/check` | 检查更新（GitHub Releases） |
+| POST | `/api/update/download` | 代理下载最新 exe（仅接受本机页面来源） |
+| POST | `/api/choose-working-dir`、`/api/validate-dir` | 目录选择器；目录路径校验（仅接受本机页面来源） |
 
 ## 已知限制
 
@@ -260,4 +268,5 @@ Cursor、Codex CLI、Claude Code、Cline 等无法发送自定义 header 时，�
 - 云端直连需要 HKDF 请求签名，本代理只走本地 daemon，不直连云端。
 - 多客户端或多工作区会按客户端身份、工作目录和逻辑会话分别绑定 daemon session，各客户端上下文互不串扰。
 - 工具调用由 daemon 在 `bypass` 模式下自行执行（如文件读写、命令执行），**不映射为 OpenAI/Anthropic 的 tool_calls 协议**；因此依赖标准 tool_calls 的客户端（如强制 function calling 的编排框架）可能无法获得工具结果透传，但对话与代码生成不受影响。
-- 模型的 `reasoning_content`（思维链）仅在 OpenAI 兼容端点返回；Anthropic 端点忽略 reasoning，只输出正文，避免客户端因缺 signature 报错。
+- 模型的 `reasoning_content`（思维链）在 OpenAI 兼容端点以 `reasoning_content` 返回；Anthropic 端点映射为 `thinking` 内容块（无 signature 字段，客户端可直接渲染）。
+- `/v1/responses` 的 `previous_response_id` 会映射回上一轮的逻辑会话以复用 daemon session；代理重启后该映射丢失，将回退按消息历史前缀识别会话。
