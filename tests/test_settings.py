@@ -353,6 +353,31 @@ def test_chat_endpoints_reject_non_list_messages(tmp_path):
     asyncio.run(run())
 
 
+def test_settings_page_script_blocks_are_balanced(tmp_path):
+    """script 块内不得出现字面闭合标签序列（含 JS 注释），否则脚本提前截断。
+
+    v0.1.17 回归：S4 修复的注释里写了字面 </script>，HTML 解析器在 raw text
+    模式下遇到即闭合脚本块，导致 Provider 下拉加载逻辑失效。"""
+
+    async def run():
+        app = create_app(
+            Config(working_dir=str(tmp_path), default_provider="AtomGit-deepseek-v4-flash")
+        )
+        app.state.daemon = ModelsDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
+            response = await client.get("/settings")
+
+        assert response.status_code == 200
+        text = response.text
+        # 脚本块开闭标签数量必须一致：不一致说明块内泄露了闭合序列
+        assert text.count("<script>") == text.count("</script>")
+        # currentVal 以 JSON 形式注入且值正确（含引号）
+        assert 'var currentVal = "AtomGit-deepseek-v4-flash";' in text
+
+    asyncio.run(run())
+
+
 def test_models_and_health_endpoints(tmp_path):
     async def run():
         app = create_app(Config(working_dir=str(tmp_path)))
