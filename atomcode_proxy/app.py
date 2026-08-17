@@ -509,9 +509,10 @@ def create_app(config: Config | None = None) -> FastAPI:
                 (function() {{
                     var fieldName = "{field_name}";
                     // script 块是 raw text，HTML 实体不会解码，需用 JSON 序列化注入；
-                    // 值中的闭合标签序列需转义斜杠，防止提前截断 script 块
-                    // （注意：本注释内也不得出现该序列，否则会同样截断脚本块）
-                    var currentVal = {json.dumps(val).replace("</", "<\\/")};
+                    // 小于号全部转义为反斜杠u003c（JS 语义不变），彻底消除闭合标签、
+                    // 注释起始、开标签等一切可能提前截断或双重转义脚本块的序列；
+                    // 注意：本注释内同样不得出现这些序列，否则会同样截断脚本块
+                    var currentVal = {json.dumps(val).replace("<", "\\u003c")};
                     var hiddenEl = document.getElementById("ds_" + fieldName + "_hidden");
                     var selectEl = document.getElementById("ds_" + fieldName + "_select");
                     var textEl = document.getElementById("ds_" + fieldName + "_text");

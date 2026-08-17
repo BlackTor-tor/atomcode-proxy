@@ -13,6 +13,7 @@
 """
 import asyncio
 import json
+import re
 import time
 
 import httpx
@@ -354,15 +355,17 @@ def test_chat_endpoints_reject_non_list_messages(tmp_path):
 
 
 def test_settings_page_script_blocks_are_balanced(tmp_path):
-    """script 块内不得出现字面闭合标签序列（含 JS 注释），否则脚本提前截断。
+    """script 块内不得出现可截断/双重转义脚本块的序列（含 JS 注释与注入值）。
 
-    v0.1.17 回归：S4 修复的注释里写了字面 </script>，HTML 解析器在 raw text
-    模式下遇到即闭合脚本块，导致 Provider 下拉加载逻辑失效。"""
+    v0.1.17 回归：S4 修复的注释里写了字面闭合标签序列，HTML 解析器在 raw text
+    模式下遇到即闭合脚本块，导致 Provider 下拉加载逻辑失效。
+    v0.1.18 后加固：注入值内的小于号全部转义为反斜杠u003c，彻底消除闭合标签、
+    注释起始、开标签等一切风险序列。"""
 
     async def run():
-        app = create_app(
-            Config(working_dir=str(tmp_path), default_provider="AtomGit-deepseek-v4-flash")
-        )
+        # 恶意/异常 provider 名模拟最坏情况注入
+        evil = 'AtomGit-x"</script><script>alert(1)//'
+        app = create_app(Config(working_dir=str(tmp_path), default_provider=evil))
         app.state.daemon = ModelsDaemon()
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
@@ -372,8 +375,28 @@ def test_settings_page_script_blocks_are_balanced(tmp_path):
         text = response.text
         # 脚本块开闭标签数量必须一致：不一致说明块内泄露了闭合序列
         assert text.count("<script>") == text.count("</script>")
-        # currentVal 以 JSON 形式注入且值正确（含引号）
-        assert 'var currentVal = "AtomGit-deepseek-v4-flash";' in text
+        # 注入值内不得残留任何尖括号（彻底防截断/双重转义）
+        assert 'var currentVal = "AtomGit-x\\"\\u003c/script>\\u003cscript>alert(1)//";' in text
+
+    asyncio.run(run())
+
+
+def test_status_page_script_blocks_are_balanced(tmp_path):
+    """状态页同样校验：script/style 块内无截断序列，开闭计数一致。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        app.state.daemon = ModelsDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
+            response = await client.get("/")
+
+        assert response.status_code == 200
+        text = response.text
+        assert text.count("<script>") == text.count("</script>")
+        assert text.count("<style>") == text.count("</style>")
+        for block in re.finditer(r"<script>(.*?)</script>", text, re.S):
+            assert "</script" not in block.group(1)
 
     asyncio.run(run())
 
