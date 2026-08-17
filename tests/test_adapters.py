@@ -16,6 +16,7 @@ class FakeDaemon:
     async def chat_with_session(self, message, **kwargs):
         self.calls.append((message, kwargs))
         yield {"type": "text", "content": "ok"}
+        yield {"type": "tokens", "prompt": 3, "completion": 1}
         yield {"type": "done", "stop_reason": "stopped"}
 
 
@@ -228,5 +229,82 @@ def test_responses_endpoint_surfaces_daemon_error_event_as_502(tmp_path):
 
         assert response.status_code == 502
         assert "Provider 'x' not found" in response.json()["error"]["message"]
+
+    asyncio.run(run())
+
+
+def test_chat_completions_stream_emits_frame_sequence_and_optional_usage(tmp_path):
+    """流式帧序列契约：首块 role 声明 -> 文本切块 -> finish_reason ->
+    （include_usage 时）usage 收尾 chunk -> [DONE]。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = FakeDaemon()
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "x",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+
+        assert response.status_code == 200
+        body = response.text
+        first_line = body.split("\n", 1)[0]
+        assert '"delta": {"role": "assistant"' in first_line
+        assert '"content": "ok"' in body
+        i_finish = body.index('"finish_reason": "stop"')
+        i_usage = body.index('"choices": []')
+        i_done = body.index("data: [DONE]")
+        assert i_finish < i_usage < i_done
+        # usage 来自 daemon 的 tokens 事件，而非估算
+        assert '"prompt_tokens": 3' in body
+        assert '"completion_tokens": 1' in body
+
+    asyncio.run(run())
+
+
+def test_chat_completions_stream_omits_usage_without_stream_options(tmp_path):
+    """未请求 include_usage 时不发 usage chunk（保持与官方默认行为一致）。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        app.state.daemon = FakeDaemon()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == 200
+        assert '"choices": []' not in response.text
+
+    asyncio.run(run())
+
+
+def test_chat_completions_stream_surfaces_daemon_error_as_text(tmp_path):
+    """流式请求遇到 daemon error 事件：以 [proxy error] 文本浮出并正常收尾。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = ErrorDaemon()
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == 200
+        assert "[proxy error]" in response.text
+        assert "Provider 'x' not found" in response.text
+        assert response.text.endswith("data: [DONE]\n\n")
 
     asyncio.run(run())

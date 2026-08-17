@@ -73,11 +73,20 @@ async def _chat_to_openai_events(
     client_key: str,
     conversation_key: str,
     history: list[dict[str, Any]],
+    include_usage: bool = False,
+    on_reply=None,
 ) -> AsyncIterator[str]:
-    """把 daemon SSE 流转为 OpenAI SSE 文本行。"""
+    """把 daemon SSE 流转为 OpenAI SSE 文本行。
+
+    include_usage：按 stream_options.include_usage 在 [DONE] 前补发
+    usage 收尾 chunk（choices 为空），与非流式响应的 usage 口径对齐。
+    on_reply：回复完成后回调完整应答文本，供会话指纹并入 assistant 应答。
+    """
     # 首块：声明 assistant 角色
     yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
 
+    text_parts: list[str] = []
+    prompt_tokens = completion_tokens = 0
     events = daemon.chat_with_session(
         message,
         working_dir=working_dir,
@@ -99,11 +108,18 @@ async def _chat_to_openai_events(
                     yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'reasoning_content': content}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
             elif etype == "text":
                 content = ev.get("content", "")
+                text_parts.append(content)
                 for i in range(0, len(content), _TEXT_CHUNK_SIZE):
                     yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'content': content[i:i + _TEXT_CHUNK_SIZE]}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+            elif etype == "tokens":
+                prompt_tokens = ev.get("prompt", 0)
+                completion_tokens = ev.get("completion", 0)
             elif etype == "done":
                 finish = _map_stop_reason(ev.get("stop_reason"))
                 yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}]}, ensure_ascii=False)}\n\n"
+                if include_usage:
+                    # 官方契约：usage chunk 在 finish_reason chunk 之后、[DONE] 之前，choices 为空
+                    yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [], 'usage': {'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens, 'total_tokens': prompt_tokens + completion_tokens}}, ensure_ascii=False)}\n\n"
                 break
             elif etype == "error":
                 # daemon 侧错误（如 Provider not found）：转为代理错误流并记录日志
@@ -112,6 +128,13 @@ async def _chat_to_openai_events(
         # 流式响应已开始无法返回状态码；记录错误并以文本形式告知客户端，避免静默中断
         log.error("openai stream aborted: %s", e)
         yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_reported, 'choices': [{'index': 0, 'delta': {'content': f'[proxy error] {e}'}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+    if on_reply is not None:
+        reply = "".join(text_parts)
+        if reply:
+            try:
+                on_reply(reply)
+            except Exception:
+                log.warning("更新会话指纹失败", exc_info=True)
     yield "data: [DONE]\n\n"
 
 
@@ -230,12 +253,21 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     log.info("openai request scope=%s conversation=%s working_dir=%s source=%s", scope, conversation_key, working_dir, working_dir_source)
 
     model_reported = model_raw or provider
+
+    def _remember_reply(reply: str) -> None:
+        # 回复完成后把 assistant 应答并入会话指纹：同一客户端发起的前缀完全
+        # 相同但应答不同的两个会话不会再被前缀匹配合并（串会话）。
+        resolver.remember(scope, conversation_key, messages + [{"role": "assistant", "content": reply}])
+
+    stream_options = body.get("stream_options")
+    include_usage = bool(isinstance(stream_options, dict) and stream_options.get("include_usage"))
     if stream:
         gen = _chat_to_openai_events(
             daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported,
             chat_id=_gen_id(), created=_now(), client_key=client_key,
             conversation_key=conversation_key, history=history,
+            include_usage=include_usage, on_reply=_remember_reply,
         )
         return StreamingResponse(
             gen,
@@ -248,6 +280,9 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             model_reported=model_reported, client_key=client_key,
             conversation_key=conversation_key, history=history,
         )
+        reply = obj["choices"][0]["message"].get("content") or ""
+        if reply:
+            _remember_reply(reply)
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:
         return JSONResponse(status_code=502, content={"error": {"message": str(e), "type": "upstream_error"}})
@@ -327,6 +362,7 @@ async def _responses_to_events(
     client_key: str,
     conversation_key: str,
     history: list[dict[str, Any]],
+    on_reply=None,
 ) -> AsyncIterator[str]:
     """把 daemon 流转为 Responses API SSE 事件序列（Codex 依赖的文本子集）。"""
     created = _now()
@@ -418,6 +454,11 @@ async def _responses_to_events(
         return
 
     full_text = "".join(text_parts)
+    if on_reply is not None and full_text:
+        try:
+            on_reply(full_text)
+        except Exception:
+            log.warning("更新会话指纹失败", exc_info=True)
     yield _resp_sse(
         "response.output_text.done",
         {
@@ -560,12 +601,18 @@ async def create_response(request: Request) -> StreamingResponse | JSONResponse:
 
     model_reported = model_raw or provider
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    def _remember_reply(reply: str) -> None:
+        # 回复完成后把 assistant 应答并入会话指纹，避免同前缀不同应答的会话串扰
+        resolver.remember(scope, conversation_key, messages + [{"role": "assistant", "content": reply}])
+
     if stream:
         gen = _responses_to_events(
             daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported,
             resp_id=resp_id, msg_id=msg_id,
             client_key=client_key, conversation_key=conversation_key, history=history,
+            on_reply=_remember_reply,
         )
         return StreamingResponse(
             gen,
@@ -578,6 +625,9 @@ async def create_response(request: Request) -> StreamingResponse | JSONResponse:
             model_reported=model_reported, resp_id=resp_id, msg_id=msg_id,
             client_key=client_key, conversation_key=conversation_key, history=history,
         )
+        reply = obj["output"][0]["content"][0].get("text") or ""
+        if reply:
+            _remember_reply(reply)
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:
         return JSONResponse(status_code=502, content={"error": {"message": str(e), "type": "upstream_error"}})

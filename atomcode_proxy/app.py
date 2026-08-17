@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 import asyncio
 import logging
-import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,6 +26,9 @@ from .updater import (
 from .workdir import choose_working_directory, normalize_working_directory
 
 log = logging.getLogger("atomcode_proxy")
+
+# 目录选择器的等待上限：人工交互场景，过短会在用户暂时离开时误报失败
+_CHOOSE_DIR_TIMEOUT = 300
 
 
 def _get_logo_base64() -> str:
@@ -55,6 +57,10 @@ def _is_local_source(request: Request, cfg: Config) -> bool:
         f"http://localhost:{cfg.port}",
         f"http://[::1]:{cfg.port}",
     }
+    if cfg.port == 80:
+        # HTTP 默认端口下，浏览器 Origin/Referer 与 Host 一样按规范省略 :80，
+        # 需同时放行裸 origin 形式，否则设置页的写操作会被误拒为跨站请求
+        allowed.update({f"http://{cfg.host}", "http://127.0.0.1", "http://localhost", "http://[::1]"})
     allowed_hosts = {
         f"{cfg.host}:{cfg.port}".lower(),
         f"127.0.0.1:{cfg.port}",
@@ -105,6 +111,14 @@ def create_app(config: Config | None = None) -> FastAPI:
         app.state.config = cfg
         log.info("daemon client ready: %s", cfg.daemon_url)
         yield
+        # 关闭当前实际生效的 daemon 客户端：设置页热切换后 app.state.daemon
+        # 已是 新 实例，仅关启动实例会漏掉对外部托管 daemon 的会话清理
+        current = getattr(app.state, "daemon", daemon)
+        if current is not daemon:
+            try:
+                await current.close()
+            except Exception as exc:
+                log.warning("关闭当前 daemon 客户端失败: %s", exc)
         await daemon.close()
 
     app = FastAPI(title="atomcode-proxy", version=__version__, lifespan=lifespan)
@@ -220,7 +234,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 f'attachment; filename="{safe_filename.encode("ascii", "replace").decode("ascii")}"; '
                 f"filename*=UTF-8''{quote(filename)}"
             ),
-            "X-Filename": safe_filename,
+            # 响应头按 latin-1 编码，非 ASCII 文件名会导致构造响应时抛 UnicodeEncodeError
+            "X-Filename": safe_filename.encode("ascii", "replace").decode("ascii"),
         }
         content_length = resp.headers.get("content-length", "")
         if content_length:
@@ -235,8 +250,14 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ── 模型列表 API ─────────────────────────────────────────────
 
     @app.get("/api/models")
-    async def api_list_models() -> JSONResponse:
-        """返回可用模型列表（从 daemon 获取）。"""
+    async def api_list_models(request: Request) -> JSONResponse:
+        """返回可用模型列表（从 daemon 获取）。
+
+        同样校验请求来源：完整 provider/模型名单属于 daemon 连接信息，
+        host=0.0.0.0 监听时不能让局域网任意主机枚举。
+        """
+        if not _is_local_source(request, cfg):
+            return JSONResponse(status_code=403, content={"error": "禁止的来源"})
         daemon: AtomCodeDaemon = app.state.daemon
         try:
             models = await daemon.list_models()
@@ -261,10 +282,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 initial = str(body["current"])
         except Exception:
             pass  # 无请求体或非 JSON 时使用默认初始目录
-        selected = await asyncio.wait_for(
-            asyncio.to_thread(choose_working_directory, initial),
-            timeout=60,
-        )
+        # 超时必须捕获：未捕获的 TimeoutError 会落为 500 纯文本，前端无法解析
+        try:
+            selected = await asyncio.wait_for(
+                asyncio.to_thread(choose_working_directory, initial),
+                timeout=_CHOOSE_DIR_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.warning("目录选择超时（%d 秒）", _CHOOSE_DIR_TIMEOUT)
+            return JSONResponse(
+                status_code=504,
+                content={"selected": False, "error": "选择目录超时，请重试"},
+            )
         if not selected:
             return JSONResponse({"selected": False, "working_dir": cfg.working_dir})
         return JSONResponse({"selected": True, "working_dir": selected})
@@ -650,10 +679,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                     return
                 if not any(s.lock.locked() for s in old._states.values()):
                     new_url, new_token = pending
-                    try:
-                        await old.close()
-                    except Exception as exc:
-                        log.warning("关闭旧 daemon 客户端失败: %s", exc)
+                    # 先原子换上新客户端再关闭旧客户端：切换后新请求立即走新连接，
+                    # 避免"判定空闲→关闭完成"期间新请求落在即将关闭的旧客户端上被掐断
                     app.state.daemon = AtomCodeDaemon(
                         new_url,
                         daemon_token=new_token,
@@ -662,7 +689,13 @@ def create_app(config: Config | None = None) -> FastAPI:
                         default_working_dir=cfg.working_dir,
                     )
                     app.state.pending_daemon_switch = None
+                    cfg.daemon_url = new_url
+                    cfg.daemon_token = new_token
                     log.info("Daemon 连接已在任务结束后切换: %s", new_url)
+                    try:
+                        await old.close()
+                    except Exception as exc:
+                        log.warning("关闭旧 daemon 客户端失败: %s", exc)
                     # 同步主进程侧生命周期：停旧进程并按新配置拉起
                     handler = getattr(app.state, "on_daemon_config_changed", None)
                     if handler is not None:
@@ -686,6 +719,14 @@ def create_app(config: Config | None = None) -> FastAPI:
         # 监听地址/端口：服务已绑定，运行时无法变更；保存后重启生效
         host = updates.get("ATOMCODE_PROXY_HOST", "").strip()
         port_raw = updates.get("ATOMCODE_PROXY_PORT", "").strip()
+        if host and ("://" in host or "/" in host or "\\" in host or any(c.isspace() for c in host)):
+            # 非法地址持久化后会导致重启 bind 失败退出，且 exe 无控制台难以排查
+            messages.append("监听地址无效（应为 IP 或主机名，不能含协议前缀、路径或空格），本次未修改监听地址")
+            updates.pop("ATOMCODE_PROXY_HOST", None)
+            host = ""
+        if not host:
+            # 留空 = 保持不变：空值持久化会从用户配置文件删除该项，导致重启后丢失
+            updates.pop("ATOMCODE_PROXY_HOST", None)
         host_changed = bool(host) and host != cfg.host
         port_changed = False
         if port_raw:
@@ -708,6 +749,10 @@ def create_app(config: Config | None = None) -> FastAPI:
         new_mode = updates.get("ATOMCODE_APPROVAL_MODE", "").strip()
         new_workdir = updates.get("ATOMCODE_PROXY_WORKDIR", "").strip()
         persist_updates = dict(updates)
+        # Daemon Token 留空 = 保持不变（与 UI 占位符承诺一致）：空值持久化会从
+        # 用户配置文件删除该项，重启后回退默认值导致 daemon 认证失败
+        if not updates.get("ATOMCODE_DAEMON_TOKEN", "").strip():
+            persist_updates.pop("ATOMCODE_DAEMON_TOKEN", None)
         if new_provider:
             cfg.default_provider = new_provider
         if new_mode:
@@ -740,19 +785,21 @@ def create_app(config: Config | None = None) -> FastAPI:
         daemon_url_changed = new_daemon_url != cfg.daemon_url
         daemon_token_changed = bool(new_daemon_token) and new_daemon_token != cfg.daemon_token
         if daemon_url_changed or daemon_token_changed:
-            cfg.daemon_url = new_daemon_url
-            if new_daemon_token:
-                cfg.daemon_token = new_daemon_token
             old = app.state.daemon
             busy = isinstance(old, AtomCodeDaemon) and any(s.lock.locked() for s in old._states.values())
             try:
                 if busy:
                     # 有进行中的任务：立即 close 会终止所有客户端正在执行的会话，
                     # 推迟到任务结束后再切换（期间新请求仍走旧连接）。
+                    # 此时不能提前改写 cfg：看门狗按 cfg.daemon_url 检测存活，
+                    # 提前指向新地址会在延迟窗口内误杀承载在途会话的旧 daemon 进程。
                     app.state.pending_daemon_switch = (new_daemon_url, new_daemon_token or cfg.daemon_token)
                     messages.append("检测到进行中的任务：Daemon 连接将在任务结束后自动切换（期间新请求仍走旧连接）")
                     _schedule_daemon_switch(app)
                 else:
+                    cfg.daemon_url = new_daemon_url
+                    if new_daemon_token:
+                        cfg.daemon_token = new_daemon_token
                     if old is not None:
                         await old.close()
                     app.state.pending_daemon_switch = None

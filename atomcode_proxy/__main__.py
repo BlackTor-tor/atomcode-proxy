@@ -466,7 +466,8 @@ def main() -> None:
     app.state.on_daemon_config_changed = _on_daemon_config_changed
 
     # --- 自动打开浏览器 ---
-    status_url = f"http://{cfg.host}:{cfg.port}/"
+    # 通配监听地址（0.0.0.0/::）对浏览器不可访问，自动打开时改用回环地址
+    status_url = f"http://{_probe_host(cfg.host)}:{cfg.port}/"
     log.info("自动打开状态页面: %s", status_url)
     webbrowser.open(status_url)
 

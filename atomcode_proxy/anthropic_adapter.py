@@ -80,6 +80,7 @@ async def _messages_to_anthropic_events(
     client_key: str,
     conversation_key: str,
     history: list[dict[str, Any]],
+    on_reply=None,
 ) -> AsyncIterator[str]:
     message_obj = {
         "id": msg_id,
@@ -94,8 +95,11 @@ async def _messages_to_anthropic_events(
     yield _sse("message_start", {"type": "message_start", "message": message_obj})
 
     output_tokens = 0
+    input_tokens = 0
+    stop_reason: str | None = None  # done 事件到达前为 None，终止时统一在 message_delta 透出
     block_index = 0  # 下一个 content block 的索引
     open_block: str | None = None  # 当前打开的 block 类型：thinking / text
+    text_parts: list[str] = []
     events = daemon.chat_with_session(
         message,
         working_dir=working_dir,
@@ -133,6 +137,7 @@ async def _messages_to_anthropic_events(
                     )
             elif etype == "text":
                 content = ev.get("content", "")
+                text_parts.append(content)
                 if open_block == "thinking":
                     # text 开始前先关闭 thinking block
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
@@ -155,17 +160,13 @@ async def _messages_to_anthropic_events(
                             "delta": {"type": "text_delta", "text": chunk},
                         },
                     )
+            elif etype == "tokens":
+                # 真实 token 统计优先于按块估算
+                input_tokens = ev.get("prompt", 0) or input_tokens
+                output_tokens = max(output_tokens, ev.get("completion", 0) or 0)
             elif etype == "done":
                 stop_reason = _map_stop_reason(ev.get("stop_reason"))
                 output_tokens = max(output_tokens, ev.get("tokens", 0) or output_tokens)
-                yield _sse(
-                    "message_delta",
-                    {
-                        "type": "message_delta",
-                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                        "usage": {"output_tokens": output_tokens},
-                    },
-                )
                 break
             elif etype == "error":
                 # daemon 侧错误（如 Provider not found）：转为代理错误流并记录日志
@@ -173,6 +174,7 @@ async def _messages_to_anthropic_events(
     except AtomCodeDaemonError as e:
         # 流式响应已开始无法返回状态码；记录错误并以文本形式告知客户端，避免静默中断
         log.error("anthropic stream aborted: %s", e)
+        stop_reason = "end_turn"
         if open_block == "thinking":
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
             block_index += 1
@@ -192,6 +194,14 @@ async def _messages_to_anthropic_events(
             },
         )
 
+    if on_reply is not None:
+        reply = "".join(text_parts)
+        if reply:
+            try:
+                on_reply(reply)
+            except Exception:
+                log.warning("更新会话指纹失败", exc_info=True)
+
     if open_block is None:
         # 未产生任何内容：补空 text block，保证 Anthropic 协议至少一个 content block
         yield _sse(
@@ -199,7 +209,18 @@ async def _messages_to_anthropic_events(
             {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}},
         )
         open_block = "text"
+    # 官方事件序：content_block_stop -> message_delta(stop_reason, usage) -> message_stop。
+    # 任何终止路径（含错误/无 done 事件）都必须发出 message_delta，
+    # 否则下游拿到的 stop_reason 恒为 null，无法区分正常与异常结束。
     yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+    yield _sse(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason or "end_turn", "stop_sequence": None},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        },
+    )
     yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -319,11 +340,17 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
     log.info("anthropic request scope=%s conversation=%s working_dir=%s source=%s", scope, conversation_key, working_dir, working_dir_source)
 
     model_reported = model_raw or provider
+
+    def _remember_reply(reply: str) -> None:
+        # 回复完成后把 assistant 应答并入会话指纹，避免同前缀不同应答的会话串扰
+        resolver.remember(scope, conversation_key, msgs + [{"role": "assistant", "content": reply}])
+
     if stream:
         gen = _messages_to_anthropic_events(
             daemon, prompt, working_dir=working_dir,
             provider=provider, model_reported=model_reported, msg_id=_gen_msg_id(),
             client_key=client_key, conversation_key=conversation_key, history=history,
+            on_reply=_remember_reply,
         )
         return StreamingResponse(
             gen,
@@ -336,6 +363,9 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             provider=provider, model_reported=model_reported, client_key=client_key,
             conversation_key=conversation_key, history=history,
         )
+        reply = "".join(b.get("text", "") for b in obj["content"] if b.get("type") == "text")
+        if reply:
+            _remember_reply(reply)
         return JSONResponse(obj)
     except AtomCodeDaemonError as e:
         return JSONResponse(

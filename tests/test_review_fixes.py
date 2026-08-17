@@ -19,7 +19,7 @@ from atomcode_proxy.config import Config
 from atomcode_proxy.conversation import ConversationKeyResolver
 from atomcode_proxy.daemon import AtomCodeDaemon
 from atomcode_proxy.updater import _parse_version
-from tests.test_adapters import FakeDaemon
+from tests.test_adapters import ErrorDaemon, FakeDaemon
 from tests.test_daemon_lifecycle import FakeResponse
 
 
@@ -240,3 +240,123 @@ def test_sanitize_download_filename():
     assert _sanitize_download_filename("atomcode-proxy-0.1.13-windows-x64.exe") == (
         "atomcode-proxy-0.1.13-windows-x64.exe"
     )
+
+
+def test_anthropic_stream_event_order_matches_official_contract(tmp_path):
+    """官方事件序：content_block_stop -> message_delta(stop_reason, usage) -> message_stop。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = FakeDaemon()
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/messages",
+                json={"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == 200
+        body = response.text
+        i_block_stop = body.index("event: content_block_stop")
+        i_delta = body.index("event: message_delta")
+        i_msg_stop = body.index("event: message_stop")
+        assert i_block_stop < i_delta < i_msg_stop
+        # message_delta 透出真实 usage（来自 daemon tokens 事件），而非恒为 0/估算
+        assert '"input_tokens": 3' in body
+
+    asyncio.run(run())
+
+
+def test_anthropic_stream_surfaces_daemon_error_with_message_delta(tmp_path):
+    """错误路径也必须发出 message_delta（stop_reason 非 null）并以 message_stop 收尾。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = ErrorDaemon()
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/v1/messages",
+                json={"model": "x", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+        assert response.status_code == 200
+        body = response.text
+        assert "[proxy error]" in body
+        assert "Provider 'x' not found" in body
+        assert body.index("event: content_block_stop") < body.index("event: message_delta")
+        assert '"stop_reason": "end_turn"' in body
+        assert "event: message_stop" in body
+
+    asyncio.run(run())
+
+
+def test_resolver_scope_count_is_bounded():
+    """scope 总量必须有上限：API Key 为任意非空值，无界 scope 会造成内存泄漏。"""
+    resolver = ConversationKeyResolver(max_entries=3)
+    for i in range(5):
+        scope = f"scope-{i}"
+        key = resolver.resolve(scope, [{"role": "user", "content": "hi"}])
+        resolver.remember(scope, key, [{"role": "user", "content": "hi"}])
+
+    assert len(resolver._entries) <= 3
+    # 最新的 scope 必须保留，最旧的被淘汰
+    assert "scope-4" in resolver._entries
+    assert "scope-0" not in resolver._entries
+
+
+class ScriptedDaemon(FakeDaemon):
+    """按调用顺序返回预设应答的模拟 daemon。"""
+
+    def __init__(self, replies):
+        super().__init__()
+        self._replies = list(replies)
+
+    async def chat_with_session(self, message, **kwargs):
+        self.calls.append((message, kwargs))
+        reply = self._replies.pop(0)
+        yield {"type": "text", "content": reply}
+        yield {"type": "done", "stop_reason": "stopped"}
+
+
+def test_distinct_conversations_with_identical_prefix_stay_isolated(tmp_path):
+    """同一客户端问了相同问题的两个会话：应答并入指纹后不得串会话。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = ScriptedDaemon(["answer-a", "answer-b", "answer-c"])
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        headers = {"User-Agent": "claude-code-test"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # 会话 A 第 1 轮与会话 B 第 1 轮发送完全相同的消息
+            for _ in range(2):
+                response = await client.post(
+                    "/v1/messages",
+                    headers=headers,
+                    json={"model": "x", "messages": [{"role": "user", "content": "hello"}]},
+                )
+                assert response.status_code == 200
+            # 会话 A 第 2 轮：携带 A 自己的应答继续追问
+            response = await client.post(
+                "/v1/messages",
+                headers=headers,
+                json={
+                    "model": "x",
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "answer-a"},
+                        {"role": "user", "content": "more"},
+                    ],
+                },
+            )
+
+        assert response.status_code == 200
+        keys = [kwargs["conversation_key"] for _, kwargs in daemon.calls]
+        # A 第 2 轮必须回到 A 自己的会话，而不是被前缀匹配并入更新的会话 B
+        assert keys[2] == keys[0]
+        assert keys[1] != keys[0]
+
+    asyncio.run(run())

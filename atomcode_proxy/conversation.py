@@ -80,6 +80,8 @@ class _ConversationFingerprint:
     key: str
     last_request: list[dict[str, str]]
     updated_at: float
+    # 指纹是否因超过 max_messages 被截断：截断的指纹退化为纯前缀匹配
+    truncated: bool = False
 
 
 class ConversationKeyResolver:
@@ -87,7 +89,7 @@ class ConversationKeyResolver:
 
     # 每条指纹最多保留的消息数：只保留开头一段即可满足前缀匹配，
     # 避免超长会话（MB 级 system prompt）在内存中无限放大。
-    # 代价是前 N 条完全相同的两个会话会命中同一 key，属可接受折中。
+    # 代价是被截断的指纹只能退化为纯前缀匹配（极长会话才会触及）。
     DEFAULT_MAX_MESSAGES_PER_ENTRY = 200
 
     def __init__(self, max_entries: int = 256, max_messages: int = DEFAULT_MAX_MESSAGES_PER_ENTRY) -> None:
@@ -100,9 +102,23 @@ class ConversationKeyResolver:
         self._response_keys: dict[tuple[str, str], str] = {}
         self._response_order: list[tuple[str, str]] = []
 
+    def _entry_matches(self, entry: _ConversationFingerprint, values: list[dict[str, str]]) -> bool:
+        """判断已存指纹是否属于当前历史的同一逻辑会话。
+
+        精确延续判定：请求时的指纹 = 此前全部消息，下一轮历史 = 该消息列
+        再接模型应答，因此指纹之后的第一条新消息必须是 assistant 角色。
+        以此区分"本会话的延续"与"发了相同问题的另一个会话"，避免串会话。
+        """
+        if not _is_prefix(entry.last_request, values):
+            return False
+        if entry.truncated:
+            return True
+        remainder = values[len(entry.last_request) :]
+        return not remainder or remainder[0].get("role") == "assistant"
+
     def _lookup_by_prefix(self, scope: str, normalized_history: list[dict[str, str]]) -> str | None:
         entries = self._entries.setdefault(scope, [])
-        matches = [entry for entry in entries if _is_prefix(entry.last_request, normalized_history)]
+        matches = [entry for entry in entries if self._entry_matches(entry, normalized_history)]
         if matches:
             return max(matches, key=lambda entry: (len(entry.last_request), entry.updated_at)).key
         return None
@@ -138,17 +154,37 @@ class ConversationKeyResolver:
                 self._response_keys.pop(old, None)
             del self._response_order[:overflow]
 
+    def _evict_scopes(self) -> None:
+        """scope 总量上限淘汰：API Key 为任意非空值，host=0.0.0.0 监听下
+        局域网主机可持续更换 Authorization/User-Agent 生成新 scope，
+        必须有全局上限防 _entries 无界增长（按 scope 内最新 updated_at 做 LRU）。"""
+        if len(self._entries) <= self.max_entries:
+            return
+        scoped = [
+            (max((entry.updated_at for entry in entries), default=0.0), scope)
+            for scope, entries in self._entries.items()
+        ]
+        scoped.sort()
+        for _, scope in scoped[: len(self._entries) - self.max_entries]:
+            del self._entries[scope]
+
     def remember(self, scope: str, key: str, messages: list[dict[str, Any]]) -> None:
         # 只保留开头 max_messages 条：前缀匹配只需开头一致，截断后仍是
         # 后续请求历史的合法前缀，同时限制单条指纹内存占用。
-        normalized = normalize_messages(messages)[: self.max_messages]
+        full = normalize_messages(messages)
+        normalized = full[: self.max_messages]
         entries = self._entries.setdefault(scope, [])
         for entry in entries:
             if entry.key == key:
                 entry.last_request = normalized
+                entry.truncated = len(full) > self.max_messages
                 entry.updated_at = time.monotonic()
-                return
-        entries.append(_ConversationFingerprint(key, normalized, time.monotonic()))
+                break
+        else:
+            entries.append(
+                _ConversationFingerprint(key, normalized, time.monotonic(), truncated=len(full) > self.max_messages)
+            )
+        self._evict_scopes()
         if len(entries) > self.max_entries:
             entries.sort(key=lambda entry: entry.updated_at, reverse=True)
             del entries[self.max_entries :]
