@@ -90,12 +90,10 @@ async def _messages_to_anthropic_events(
         "usage": {"input_tokens": 0, "output_tokens": 0},
     }
     yield _sse("message_start", {"type": "message_start", "message": message_obj})
-    yield _sse(
-        "content_block_start",
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-    )
 
     output_tokens = 0
+    block_index = 0  # 下一个 content block 的索引
+    open_block: str | None = None  # 当前打开的 block 类型：thinking / text
     events = daemon.chat_with_session(
         message,
         working_dir=working_dir,
@@ -111,8 +109,39 @@ async def _messages_to_anthropic_events(
                 yield _sse("ping", {"type": "ping"})
                 continue
             etype = ev.get("type")
-            if etype == "text":
+            if etype == "reasoning":
                 content = ev.get("content", "")
+                if not content:
+                    continue
+                # 懒开启 thinking block；text 已开始后的 reasoning 忽略（罕见乱序）
+                if open_block is None:
+                    yield _sse(
+                        "content_block_start",
+                        {"type": "content_block_start", "index": block_index, "content_block": {"type": "thinking", "thinking": ""}},
+                    )
+                    open_block = "thinking"
+                if open_block == "thinking":
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index,
+                            "delta": {"type": "thinking_delta", "thinking": content},
+                        },
+                    )
+            elif etype == "text":
+                content = ev.get("content", "")
+                if open_block == "thinking":
+                    # text 开始前先关闭 thinking block
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+                    block_index += 1
+                    open_block = None
+                if open_block is None:
+                    yield _sse(
+                        "content_block_start",
+                        {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}},
+                    )
+                    open_block = "text"
                 for i in range(0, len(content), _TEXT_CHUNK_SIZE):
                     chunk = content[i:i + _TEXT_CHUNK_SIZE]
                     output_tokens += 1
@@ -120,7 +149,7 @@ async def _messages_to_anthropic_events(
                         "content_block_delta",
                         {
                             "type": "content_block_delta",
-                            "index": 0,
+                            "index": block_index,
                             "delta": {"type": "text_delta", "text": chunk},
                         },
                     )
@@ -142,16 +171,33 @@ async def _messages_to_anthropic_events(
     except AtomCodeDaemonError as e:
         # 流式响应已开始无法返回状态码；记录错误并以文本形式告知客户端，避免静默中断
         log.error("anthropic stream aborted: %s", e)
+        if open_block == "thinking":
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
+            block_index += 1
+            open_block = None
+        if open_block is None:
+            yield _sse(
+                "content_block_start",
+                {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}},
+            )
+            open_block = "text"
         yield _sse(
             "content_block_delta",
             {
                 "type": "content_block_delta",
-                "index": 0,
+                "index": block_index,
                 "delta": {"type": "text_delta", "text": f"[proxy error] {e}"},
             },
         )
 
-    yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+    if open_block is None:
+        # 未产生任何内容：补空 text block，保证 Anthropic 协议至少一个 content block
+        yield _sse(
+            "content_block_start",
+            {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}},
+        )
+        open_block = "text"
+    yield _sse("content_block_stop", {"type": "content_block_stop", "index": block_index})
     yield _sse("message_stop", {"type": "message_stop"})
 
 
@@ -167,6 +213,7 @@ async def _messages_to_anthropic_object(
     history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     stop_reason = "stopped"
     input_tokens = output_tokens = 0
     async for ev in daemon.chat_with_session(
@@ -180,6 +227,8 @@ async def _messages_to_anthropic_object(
         etype = ev.get("type")
         if etype == "text":
             text_parts.append(ev.get("content", ""))
+        elif etype == "reasoning":
+            reasoning_parts.append(ev.get("content", ""))
         elif etype == "tokens":
             input_tokens = ev.get("prompt", 0)
             output_tokens = ev.get("completion", 0)
@@ -188,12 +237,16 @@ async def _messages_to_anthropic_object(
             raise AtomCodeDaemonError(f"daemon error: {ev.get('message', 'unknown error')}")
         elif etype == "done":
             stop_reason = ev.get("stop_reason") or stop_reason
+    content: list[dict[str, Any]] = []
+    if reasoning_parts:
+        content.append({"type": "thinking", "thinking": "".join(reasoning_parts)})
+    content.append({"type": "text", "text": "".join(text_parts)})
     return {
         "id": _gen_msg_id(),
         "type": "message",
         "role": "assistant",
         "model": model_reported,
-        "content": [{"type": "text", "text": "".join(text_parts)}],
+        "content": content,
         "stop_reason": _map_stop_reason(stop_reason),
         "stop_sequence": None,
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},

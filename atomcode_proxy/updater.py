@@ -27,17 +27,22 @@ CACHE_TTL = 300.0  # 5 分钟
 _last_check: tuple[str, float, dict | None] | None = None  # (current_version, monotonic 时间戳, 结果；None=无更新)
 
 
-def _parse_version(version: str) -> tuple[int, ...]:
-    """将版本字符串解析为整数元组，如 'v0.1.5' -> (0, 1, 5)。
+def _parse_version(version: str) -> tuple[tuple[int, ...], int]:
+    """将版本字符串解析为可比较元组，如 'v0.1.5-rc1' -> ((0, 1, 5), 0)。
 
-    非数字部分自动忽略；预发布后缀（-rc1 / +build2 等）不参与比较；
-    空版本回退为 (0,)。
+    第一项为数字元组；第二项为发布级：无预发布后缀记 1（高于任何预发布），
+    有 -rc1/-beta 等后缀记 0。这样 0.1.13-rc1 < 0.1.13，预发布不会被
+    误判为“已是最新”。预发布标识本身不细分比较（本项目无多 rc 序列）。
+    空版本回退为 ((0,), 0)。
     """
     if not version:
-        return (0,)
-    core = re.split(r"[-+]", version.strip().lstrip("vV"))[0]
-    parts = re.findall(r"\d+", core)
-    return tuple(int(p) for p in parts) if parts else (0,)
+        return ((0,), 0)
+    stripped = version.strip().lstrip("vV")
+    core = re.split(r"[+]", stripped, maxsplit=1)[0]
+    parts = re.findall(r"\d+", core.split("-", 1)[0])
+    nums = tuple(int(p) for p in parts) if parts else (0,)
+    is_release = 0 if "-" in core else 1
+    return (nums, is_release)
 
 
 async def check_for_update(current_version: str) -> dict | None:

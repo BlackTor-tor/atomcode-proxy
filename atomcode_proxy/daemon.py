@@ -53,6 +53,8 @@ class ConversationState:
     working_dir: str
     session_id: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 最近一次被 _state_for 命中的时间，用于超量时按 LRU 淘汰
+    last_used: float = field(default_factory=time.monotonic)
 
 
 class AtomCodeDaemon:
@@ -137,28 +139,38 @@ class AtomCodeDaemon:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            # 当前任务已被取消时，继续等待独立 stop task 完成。
-            await task
+            # 当前任务已被取消：继续等待独立 stop task 完成后必须重新抛出取消，
+            # 否则取消被吞掉会破坏 asyncio 的结构化取消语义。
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
     async def _state_for(self, conversation_key: str, working_dir: str) -> ConversationState:
-        old_session_id: str | None = None
+        old_session_ids: list[str] = []
         async with self._states_lock:
             state = self._states.get(conversation_key)
             if state is None or state.working_dir != working_dir:
-                if state is not None:
-                    old_session_id = state.session_id
+                if state is not None and state.session_id:
+                    old_session_ids.append(state.session_id)
                 state = ConversationState(conversation_key, working_dir)
                 self._states[conversation_key] = state
-                if len(self._states) > MAX_CONVERSATIONS:
-                    candidates = [
-                        (key, value)
-                        for key, value in self._states.items()
-                        if key != conversation_key and not value.lock.locked()
-                    ]
-                    if candidates:
-                        self._states.pop(candidates[0][0], None)
-        if old_session_id:
-            await self._stop_chat_shielded(old_session_id)
+            else:
+                state.last_used = time.monotonic()
+            if len(self._states) > MAX_CONVERSATIONS:
+                # 按 LRU 淘汰最久未用且未被占用的会话；被淘汰者若持有
+                # daemon session 需记录并停止，避免 daemon 侧残留任务。
+                candidates = [
+                    (value.last_used, key, value)
+                    for key, value in self._states.items()
+                    if key != conversation_key and not value.lock.locked()
+                ]
+                if candidates:
+                    _, _evict_key, evicted = min(candidates, key=lambda item: item[0])
+                    self._states.pop(_evict_key, None)
+                    if evicted.session_id:
+                        old_session_ids.append(evicted.session_id)
+        # 在锁外执行网络请求，避免长时间持有 _states_lock
+        for session_id in old_session_ids:
+            await self._stop_chat_shielded(session_id)
         return state
 
     async def _ensure_session(self, state: ConversationState, history: list[dict[str, Any]]) -> str:

@@ -8,6 +8,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -45,6 +46,8 @@ def _is_local_source(request: Request, cfg: Config) -> bool:
 
     恶意网页发起的跨站请求会携带其自身的 Origin/Referer，
     与本服务地址不匹配即拒绝；无来源头的直连请求（如 curl、IDE 客户端）放行。
+    另校验 Host 头白名单：DNS rebinding 攻击下浏览器请求的 Host 是攻击者
+    域名而非本机地址，且同源请求可无 Origin/Referer，仅靠来源头拦不住。
     """
     allowed = {
         f"http://{cfg.host}:{cfg.port}",
@@ -52,12 +55,30 @@ def _is_local_source(request: Request, cfg: Config) -> bool:
         f"http://localhost:{cfg.port}",
         f"http://[::1]:{cfg.port}",
     }
+    allowed_hosts = {
+        f"{cfg.host}:{cfg.port}".lower(),
+        f"127.0.0.1:{cfg.port}",
+        f"localhost:{cfg.port}",
+        f"[::1]:{cfg.port}",
+    }
+    if cfg.port == 80:
+        # HTTP 默认端口下，客户端 Host 头按规范省略 :80，需同时放行裸主机名形式
+        allowed_hosts.update({cfg.host.lower(), "127.0.0.1", "localhost", "[::1]"})
+    host = (request.headers.get("host") or "").strip().lower()
+    if host and host not in allowed_hosts:
+        return False
     origin = request.headers.get("origin", "")
     referer = request.headers.get("referer", "")
     for value in (origin, referer):
         if value and not any(value == p or value.startswith(p + "/") for p in allowed):
             return False
     return True
+
+
+def _sanitize_download_filename(name: str) -> str:
+    """净化下载文件名：去除引号/反斜杠/换行等会破坏 HTTP 头的字符。"""
+    cleaned = "".join(c if c.isprintable() and c not in '"\\\r\n' else "_" for c in name)
+    return cleaned.strip() or "update.exe"
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -183,10 +204,15 @@ def create_app(config: Config | None = None) -> FastAPI:
                 await resp.aclose()
                 await client.aclose()
 
+        safe_filename = _sanitize_download_filename(filename)
         headers = {
-            # attachment 提示浏览器保存为文件；X-Filename 供前端读取文件名
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Filename": filename,
+            # attachment 提示浏览器保存为文件；X-Filename 供前端读取文件名。
+            # filename* 保留原始非 ASCII 文件名，filename 为净化后的 ASCII 兼容回退。
+            "Content-Disposition": (
+                f'attachment; filename="{safe_filename.encode("ascii", "replace").decode("ascii")}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            ),
+            "X-Filename": safe_filename,
         }
         content_length = resp.headers.get("content-length", "")
         if content_length:
@@ -260,6 +286,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     # 内置默认值：系统环境变量、atomcode-proxy-config.json 和 .env 均未覆盖时，设置页回退显示这些值。
     # 取自 cfg（已合并环境变量 / atomcode-proxy-config.json / .env / 内置默认），避免默认值重复定义。
+    # 注意：这是 create_app 时的启动快照，运行时热更新不会刷新，仅作设置页回退显示用。
     _BUILTIN_DEFAULTS: dict[str, str] = {
         "ATOMCODE_PROXY_HOST": cfg.host,
         "ATOMCODE_PROXY_PORT": str(cfg.port),
@@ -312,7 +339,8 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         msg_html = ""
         if message:
-            msg_html = f'<div style="background:#d4edda;color:#155724;padding:12px 16px;border-radius:8px;margin-bottom:20px;">{message}</div>'
+            safe_msg = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            msg_html = f'<div style="background:#d4edda;color:#155724;padding:12px 16px;border-radius:8px;margin-bottom:20px;">{safe_msg}</div>'
 
         fields_html = ""
         for field_name, label, input_type, options in _SETTING_FIELDS:
@@ -405,7 +433,8 @@ def create_app(config: Config | None = None) -> FastAPI:
                 )
                 input_html = f'<select name="{field_name}" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px;">{opts}</select>'
             elif input_type == "dynamic-select":
-                escaped_val = val.replace('"', '&quot;')
+                # 完整转义：值含 </script> 或引号时不能破坏属性/脚本块
+                escaped_val = val.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
                 input_html = f'''
                 <div id="ds_{field_name}_wrap">
                     <input type="hidden" name="{field_name}" id="ds_{field_name}_hidden" value="{escaped_val}">
@@ -663,6 +692,16 @@ def create_app(config: Config | None = None) -> FastAPI:
                 daemon.approval_mode = cfg.approval_mode
                 daemon.default_working_dir = cfg.working_dir
 
+        # 环境变量优先级高于用户配置文件：被覆盖的项重启后会恢复环境变量值，需明确提示
+        env_overridden = sorted(
+            key for key, val in persist_updates.items() if os.environ.get(key) and os.environ.get(key) != val
+        )
+        if env_overridden:
+            messages.append(
+                "注意：以下配置项已被环境变量（含 .env）覆盖，重启后将恢复为环境变量的值："
+                + "、".join(env_overridden)
+            )
+
         messages.append("配置已保存并立即生效")
 
         # 持久化到用户配置文件（exe 旁不生成任何文件）
@@ -812,10 +851,18 @@ def create_app(config: Config | None = None) -> FastAPI:
                 var providers = data.providers || [];
                 var models = data.models || [];
                 var html = "<p>可用 Provider: <strong>" + providers.length + "</strong> 个，模型: <strong>" + models.length + "</strong> 个</p>";
-                if (providers.length > 0) {{
-                    html += "<div>" + providers.map(function(p) {{ return '<span class=\\"model-tag\\">' + p + '</span>'; }}).join("") + "</div>";
-                }}
                 el.innerHTML = html;
+                if (providers.length > 0) {{
+                    // provider 名来自 daemon，用 textContent 渲染防 HTML 注入
+                    var wrap = document.createElement("div");
+                    providers.forEach(function(p) {{
+                        var tag = document.createElement("span");
+                        tag.className = "model-tag";
+                        tag.textContent = p;
+                        wrap.appendChild(tag);
+                    }});
+                    el.appendChild(wrap);
+                }}
             }})
             .catch(function(err) {{
                 el.innerHTML = '<p class="info" style="color:#dc3545;">无法获取模型列表: ' + err.message + '</p>';

@@ -85,8 +85,14 @@ class _ConversationFingerprint:
 class ConversationKeyResolver:
     """按显式 ID 或完整历史前缀识别上游逻辑会话。"""
 
-    def __init__(self, max_entries: int = 256) -> None:
+    # 每条指纹最多保留的消息数：只保留开头一段即可满足前缀匹配，
+    # 避免超长会话（MB 级 system prompt）在内存中无限放大。
+    # 代价是前 N 条完全相同的两个会话会命中同一 key，属可接受折中。
+    DEFAULT_MAX_MESSAGES_PER_ENTRY = 200
+
+    def __init__(self, max_entries: int = 256, max_messages: int = DEFAULT_MAX_MESSAGES_PER_ENTRY) -> None:
         self.max_entries = max_entries
+        self.max_messages = max_messages
         self._entries: dict[str, list[_ConversationFingerprint]] = {}
 
     def resolve(
@@ -107,7 +113,9 @@ class ConversationKeyResolver:
         return f"generated:{scope}:{uuid.uuid4().hex}"
 
     def remember(self, scope: str, key: str, messages: list[dict[str, Any]]) -> None:
-        normalized = normalize_messages(messages)
+        # 只保留开头 max_messages 条：前缀匹配只需开头一致，截断后仍是
+        # 后续请求历史的合法前缀，同时限制单条指纹内存占用。
+        normalized = normalize_messages(messages)[: self.max_messages]
         entries = self._entries.setdefault(scope, [])
         for entry in entries:
             if entry.key == key:

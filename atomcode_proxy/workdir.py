@@ -1,8 +1,11 @@
 """工作目录解析与本机目录选择。"""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger("atomcode_proxy.workdir")
 
 
 def normalize_working_directory(value: str | os.PathLike[str] | None) -> str | None:
@@ -31,9 +34,12 @@ def choose_working_directory(initial_dir: str | None = None) -> str | None:
         return None
 
     initial = normalize_working_directory(initial_dir) or str(Path.home())
+    # tkinter 官方仅支持主线程，在 asyncio.to_thread 的工作线程中运行可能抛
+    # TclError/RuntimeException 等各类异常，统一捕获降级为“未选择”。
     try:
         root = tk.Tk()
-    except tk.TclError:
+    except Exception as exc:
+        log.warning("初始化目录选择器失败: %s", exc)
         return None
     root.withdraw()
     try:
@@ -47,6 +53,12 @@ def choose_working_directory(initial_dir: str | None = None) -> str | None:
             title="选择 AtomCode 代理工作目录",
             mustexist=True,
         )
+    except Exception as exc:
+        log.warning("打开目录选择器失败: %s", exc)
+        return None
     finally:
-        root.destroy()
+        try:
+            root.destroy()
+        except Exception:
+            pass
     return normalize_working_directory(selected)

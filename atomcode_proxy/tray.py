@@ -5,12 +5,10 @@ import logging
 import os
 import sys
 import webbrowser
+from pathlib import Path
 from typing import Callable
 
 log = logging.getLogger("atomcode_proxy.tray")
-
-
-from pathlib import Path
 
 
 def _load_logo_path() -> Path | None:

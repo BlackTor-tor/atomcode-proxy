@@ -17,7 +17,6 @@ logs
 build/
 dist/
 release/
-tests
 
 # Windows 图标缓存垃圾目录（tkinter/托盘触发生成）
 %SystemDrive%/

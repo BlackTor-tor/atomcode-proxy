@@ -50,17 +50,27 @@ def _is_port_listening(host: str, port: int) -> bool:
 # daemon 健康检查
 # ---------------------------------------------------------------------------
 
-def _is_daemon_running(daemon_url: str, timeout: float = 1.0) -> bool:
-    """尝试连接 daemon，判断是否已在运行。"""
+def _is_daemon_running(daemon_url: str, timeout: float = 1.5) -> bool:
+    """向 daemon 发一次真实 HTTP 请求判断是否在运行。
+
+    仅 TCP 可连不足以证明端口上是 daemon（可能被其他程序占用）；
+    任何 HTTP 响应（含 404/401 等错误状态）都证明端口上是 HTTP 服务。
+    """
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    parsed = urlparse(daemon_url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 13456
     try:
-        # daemon 没有专门的 health 端点，用极短超时尝试连接端口
-        from urllib.parse import urlparse
-        parsed = urlparse(daemon_url)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 13456
-        with socket.create_connection((host, port), timeout=timeout):
+        with urllib.request.urlopen(f"{scheme}://{host}:{port}/models", timeout=timeout):
             return True
-    except (OSError, ConnectionRefusedError):
+    except urllib.error.HTTPError:
+        # 收到 HTTP 错误响应也说明是 HTTP 服务在监听
+        return True
+    except (OSError, ValueError):
         return False
 
 
@@ -149,11 +159,13 @@ def _daemon_watchdog(
     cfg: Config,
     daemon_exe: Path | None,
     daemon_proc_holder: list[subprocess.Popen | None],
+    daemon_proc_lock: threading.Lock,
     stop_event: threading.Event,
 ) -> None:
     """后台看门狗线程：每 60 秒检测 daemon 是否存活，失效则自动重启。
 
-    daemon_proc_holder: 单元素列表，用于在闭包中可变引用 daemon 进程对象。
+    daemon_proc_holder: 单元素列表，用于在闭包中可变引用 daemon 进程对象；
+    与主线程的读写均需持有 daemon_proc_lock，避免退出时漏停被替换的进程。
     stop_event: 代理退出时 set，看门狗随之退出。
     """
     log.info("daemon 看门狗已启动（检测间隔 60 秒）")
@@ -173,7 +185,8 @@ def _daemon_watchdog(
         new_proc = _start_daemon(exe, cfg.daemon_port)
         if new_proc is not None:
             log.info("daemon 已重启 (PID: %d)", new_proc.pid)
-            daemon_proc_holder[0] = new_proc
+            with daemon_proc_lock:
+                daemon_proc_holder[0] = new_proc
             # 等待新 daemon 就绪
             time.sleep(2.0)
         else:
@@ -307,13 +320,15 @@ def main() -> None:
 
     # --- 启动 daemon 看门狗（后台线程）---
     watchdog_stop = threading.Event()
-    # 用列表持有 daemon 进程引用，以便看门狗重启时更新
+    # 用列表持有 daemon 进程引用，以便看门狗重启时更新；
+    # 与看门狗线程的读写用锁同步，避免退出时漏停被替换的进程
+    daemon_proc_lock = threading.Lock()
     daemon_proc_holder: list[subprocess.Popen | None] = [daemon_proc]
     # 记住 daemon 可执行文件路径，避免看门狗重复查找
     daemon_exe_cached = _find_daemon_executable() if daemon_proc is None else None
     watchdog_thread = threading.Thread(
         target=_daemon_watchdog,
-        args=(cfg, daemon_exe_cached, daemon_proc_holder, watchdog_stop),
+        args=(cfg, daemon_exe_cached, daemon_proc_holder, daemon_proc_lock, watchdog_stop),
         daemon=True,
     )
     watchdog_thread.start()
@@ -321,10 +336,15 @@ def main() -> None:
     # --- 启动 FastAPI 服务（后台线程）---
     app = create_app(cfg)
     server_error: list[Exception | None] = [None]
+    # 用 uvicorn.Server 而非 uvicorn.run：保留 server 引用供退出时
+    # 设置 should_exit 优雅关闭，触发 lifespan 清理（停止 daemon 会话等）。
+    server = uvicorn.Server(
+        uvicorn.Config(app, host=cfg.host, port=cfg.port, log_level="warning")
+    )
 
     def _run_server() -> None:
         try:
-            uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning")
+            server.run()
         except Exception as exc:
             server_error[0] = exc
             log.error("uvicorn 启动失败: %s", exc, exc_info=True)
@@ -368,9 +388,13 @@ def main() -> None:
     def on_stop():
         """托盘退出回调。"""
         log.info("正在停止服务...")
+        # 先优雅关闭 HTTP 服务：触发 lifespan 清理（停止 daemon 会话、关闭 httpx 连接）
+        server.should_exit = True
+        server_thread.join(timeout=10)
         watchdog_stop.set()
         watchdog_thread.join(timeout=5)
-        _stop_daemon(daemon_proc_holder[0])
+        with daemon_proc_lock:
+            _stop_daemon(daemon_proc_holder[0])
         log.info("服务已停止")
 
     tray = SystemTray(cfg.host, cfg.port, log_path)
