@@ -196,15 +196,6 @@ class Config:
         cfg.model_alias = aliases
         return cfg
 
-    def resolve_provider(self, model: str | None) -> str:
-        """把上游请求的 model 名解析为 daemon 的 provider 名。"""
-        if not model:
-            return self.default_provider
-        if model in self.model_alias:
-            return self.model_alias[model]
-        # 直接透传（daemon 侧认识自己的 provider 名）
-        return model
-
     @property
     def daemon_port(self) -> int:
         """从 daemon_url 解析端口号。"""

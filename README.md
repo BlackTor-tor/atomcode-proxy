@@ -238,7 +238,8 @@ Cursor、Codex CLI、Claude Code、Cline 等无法发送自定义 header 时，�
 
 ## 协议映射说明
 
-- OpenAI/Anthropic `messages` 的当前 prompt 发给 daemon；首次建立或恢复 session 时，之前的完整消息历史会写回 daemon。
+- OpenAI/Anthropic `messages` 与 Responses `input` 的当前 prompt 发给 daemon；首次建立或恢复 session 时，之前的完整消息历史会写回 daemon。
+- 未知模型名（如 `claude-*`/`gpt-*`）不在 daemon provider 名单时自动回退默认 provider；daemon 返回的 error 事件会以 502 或错误文本浮出，不再静默丢弃。
 - `reasoning` 事件映射为 OpenAI 的 `reasoning_content`（DeepSeek 风格）；Anthropic 端忽略 reasoning 只传正文。
 - `text` 事件按 8 字符切块模拟流式输出。
 - 工具调用：daemon 处于 `bypass` 模式自行执行工具，代理不做透传。
@@ -248,6 +249,7 @@ Cursor、Codex CLI、Claude Code、Cline 等无法发送自定义 header 时，�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/v1/chat/completions` | OpenAI 对话（stream 与非 stream） |
+| POST | `/v1/responses` | OpenAI Responses API，Codex CLI 默认协议（stream 与非 stream，文本子集） |
 | GET | `/v1/models` | 模型列表（OpenAI 格式） |
 | POST | `/v1/messages` | Anthropic 对话（stream 与非 stream） |
 | GET | `/health` | 健康检查 |

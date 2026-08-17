@@ -104,37 +104,52 @@ async def _messages_to_anthropic_events(
         conversation_key=conversation_key,
         history=history,
     )
-    async for ev in with_heartbeat(events):
-        if ev is HEARTBEAT:
-            # 模型长时间无事件输出时的心跳：Anthropic 官方 ping 事件，客户端视为连接存活
-            yield _sse("ping", {"type": "ping"})
-            continue
-        etype = ev.get("type")
-        if etype == "text":
-            content = ev.get("content", "")
-            for i in range(0, len(content), _TEXT_CHUNK_SIZE):
-                chunk = content[i:i + _TEXT_CHUNK_SIZE]
-                output_tokens += 1
+    try:
+        async for ev in with_heartbeat(events):
+            if ev is HEARTBEAT:
+                # 模型长时间无事件输出时的心跳：Anthropic 官方 ping 事件，客户端视为连接存活
+                yield _sse("ping", {"type": "ping"})
+                continue
+            etype = ev.get("type")
+            if etype == "text":
+                content = ev.get("content", "")
+                for i in range(0, len(content), _TEXT_CHUNK_SIZE):
+                    chunk = content[i:i + _TEXT_CHUNK_SIZE]
+                    output_tokens += 1
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": chunk},
+                        },
+                    )
+            elif etype == "done":
+                stop_reason = _map_stop_reason(ev.get("stop_reason"))
+                output_tokens = max(output_tokens, ev.get("tokens", 0) or output_tokens)
                 yield _sse(
-                    "content_block_delta",
+                    "message_delta",
                     {
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": chunk},
+                        "type": "message_delta",
+                        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                        "usage": {"output_tokens": output_tokens},
                     },
                 )
-        elif etype == "done":
-            stop_reason = _map_stop_reason(ev.get("stop_reason"))
-            output_tokens = max(output_tokens, ev.get("tokens", 0) or output_tokens)
-            yield _sse(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
-                },
-            )
-            break
+                break
+            elif etype == "error":
+                # daemon 侧错误（如 Provider not found）：转为代理错误流并记录日志
+                raise AtomCodeDaemonError(f"daemon error: {ev.get('message', 'unknown error')}")
+    except AtomCodeDaemonError as e:
+        # 流式响应已开始无法返回状态码；记录错误并以文本形式告知客户端，避免静默中断
+        log.error("anthropic stream aborted: %s", e)
+        yield _sse(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": f"[proxy error] {e}"},
+            },
+        )
 
     yield _sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield _sse("message_stop", {"type": "message_stop"})
@@ -168,6 +183,9 @@ async def _messages_to_anthropic_object(
         elif etype == "tokens":
             input_tokens = ev.get("prompt", 0)
             output_tokens = ev.get("completion", 0)
+        elif etype == "error":
+            # daemon 侧错误（如 Provider not found）：浮出为 502，避免静默空响应
+            raise AtomCodeDaemonError(f"daemon error: {ev.get('message', 'unknown error')}")
         elif etype == "done":
             stop_reason = ev.get("stop_reason") or stop_reason
     return {
@@ -186,7 +204,9 @@ async def _messages_to_anthropic_object(
 async def messages(request: Request) -> StreamingResponse | JSONResponse:
     body = await request.json()
     model_raw = body.get("model")
-    provider = request.app.state.config.resolve_provider(model_raw)
+    daemon: AtomCodeDaemon = request.app.state.daemon
+    cfg = request.app.state.config
+    provider = await daemon.resolve_provider(model_raw, cfg.model_alias, cfg.default_provider)
     stream = bool(body.get("stream", False))
     msgs = _messages_with_system(body)
     message = _extract_user_text(msgs)
@@ -196,8 +216,6 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "empty user message"}},
         )
 
-    daemon: AtomCodeDaemon = request.app.state.daemon
-    cfg = request.app.state.config
     client_key = _client_key(request)
 
     prompt, history = split_prompt_messages(msgs)

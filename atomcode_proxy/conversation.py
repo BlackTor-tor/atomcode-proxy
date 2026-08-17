@@ -37,19 +37,24 @@ def content_to_text(content: Any) -> str:
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """规范化为 daemon 导入接口可接受的消息列表。
+
+    daemon 的 /sessions/{id}/messages 仅接受 user/assistant 角色（AtomCode 5.0.5 起
+    对 system/tool/function 等角色返回 400），因此其余角色统一降级为 user 消息，
+    并以 [role] 前缀保留原始语义。
+    """
     normalized: list[dict[str, str]] = []
     for message in messages:
         role = str(message.get("role", ""))
-        item = {"role": role, "content": content_to_text(message.get("content"))}
+        content = content_to_text(message.get("content"))
         tool_calls = message.get("tool_calls")
         if tool_calls:
             suffix = f"[tool_calls] {json.dumps(tool_calls, ensure_ascii=False)}"
-            item["content"] = f"{item['content']}\n{suffix}".strip()
-        for field in ("name", "tool_call_id"):
-            value = message.get(field)
-            if value is not None:
-                item[field] = str(value)
-        normalized.append(item)
+            content = f"{content}\n{suffix}".strip()
+        if role not in ("user", "assistant"):
+            content = f"[{role or 'unknown'}] {content}".strip()
+            role = "user"
+        normalized.append({"role": role, "content": content})
     return normalized
 
 
@@ -133,7 +138,7 @@ def explicit_conversation_id(headers: Mapping[str, str], body: Mapping[str, Any]
         if value and value.strip():
             return value.strip()
 
-    for name in ("conversation_id", "conversationId", "session_id", "sessionId"):
+    for name in ("conversation_id", "conversationId", "session_id", "sessionId", "conversation", "previous_response_id"):
         value = body.get(name)
         if isinstance(value, str) and value.strip():
             return value.strip()

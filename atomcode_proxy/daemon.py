@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
@@ -25,6 +26,9 @@ BASE_HEADERS_DEFAULT = {
 
 # 代理只为每个逻辑会话保留一个 daemon session，避免并发请求被分配到无历史的新 session。
 MAX_CONVERSATIONS = 256
+
+# provider 名单缓存有效期（秒）
+_PROVIDERS_CACHE_TTL = 300.0
 
 
 class AtomCodeDaemonError(RuntimeError):
@@ -79,6 +83,9 @@ class AtomCodeDaemon:
         )
         self._states: dict[str, ConversationState] = {}
         self._states_lock = asyncio.Lock()
+        # daemon provider 名单缓存（用于未知模型名回退判断）
+        self._providers_cache: set[str] = set()
+        self._providers_cached_at: float = 0.0
 
     async def close(self) -> None:
         states = list(self._states.values())
@@ -173,6 +180,47 @@ class AtomCodeDaemon:
         if resp.status_code != 200:
             raise AtomCodeDaemonError(f"list models failed: {resp.status_code} {resp.text[:300]}")
         return resp.json()
+
+    async def known_providers(self) -> set[str]:
+        """返回 daemon 已知 provider 名集合（带 TTL 缓存）。
+
+        获取失败时返回空集，调用方应回退到直接透传，避免 daemon 不可用时段接全断。
+        """
+        now = time.monotonic()
+        if self._providers_cache and now - self._providers_cached_at < _PROVIDERS_CACHE_TTL:
+            return self._providers_cache
+        try:
+            models = await self.list_models()
+        except AtomCodeDaemonError as exc:
+            log.warning("获取 provider 名单失败，模型名解析回退透传: %s", exc)
+            return set()
+        self._providers_cache = {m.get("provider", "") for m in models if m.get("provider")}
+        self._providers_cached_at = now
+        return self._providers_cache
+
+    async def resolve_provider(
+        self,
+        model: str | None,
+        aliases: dict[str, str] | None = None,
+        default_provider: str | None = None,
+    ) -> str:
+        """把上游请求的 model 名解析为 daemon 的 provider 名。
+
+        优先级：别名映射 > 已知 provider 名透传 > 回退默认 provider。
+        客户端默认模型名（claude-*/gpt-* 等）不在 daemon 名单内时回退默认值，
+        避免daemon 返回 error 事件被吞掉后变成静默空响应。
+        """
+        default_provider = default_provider or self.default_provider
+        if not model:
+            return default_provider
+        if aliases and model in aliases:
+            return aliases[model]
+        known = await self.known_providers()
+        if not known or model in known:
+            # 名单不可用时维持旧的透传行为（错误会由适配器的 error 事件处理浮出）
+            return model
+        log.warning("模型名 %r 不在 daemon provider 名单中，回退默认 provider %r", model, default_provider)
+        return default_provider
 
     # ---------- 对话 ----------
 
