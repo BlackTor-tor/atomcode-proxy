@@ -13,7 +13,9 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import AsyncIterator, Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -29,6 +31,27 @@ MAX_CONVERSATIONS = 256
 
 # provider 名单缓存有效期（秒）
 _PROVIDERS_CACHE_TTL = 300.0
+
+
+def _read_dynamic_daemon_token(base_url: str) -> str | None:
+    """读取 atomcode 5.0.6+ daemon 写入 ~/.atomcode/daemon-<port>.json 的随机 token。
+
+    5.0.6 起 daemon 不再接受固定的 atomcode_webui token，每次启动生成
+    随机 token 写入该文件。仅本地 daemon 适用；文件缺失/损坏（含 5.0.5
+    等旧版本）返回 None，调用方回退到配置的静态 token。
+    """
+    try:
+        parsed = urlparse(base_url)
+        host = (parsed.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return None
+        port = parsed.port or 13456
+        data = json.loads((Path.home() / ".atomcode" / f"daemon-{port}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.debug("读取 daemon 动态 token 文件失败: %s", exc)
+        return None
+    token = data.get("token")
+    return token if isinstance(token, str) and token else None
 
 
 def _wrap_httpx_errors(exc: Exception) -> AtomCodeDaemonError:
@@ -83,8 +106,13 @@ class AtomCodeDaemon:
         self.default_provider = default_provider
         self.approval_mode = approval_mode
         self.default_working_dir = default_working_dir
+        # 本地 daemon 优先用 5.0.6+ 的动态 token；文件不存在（旧版/远程）
+        # 回退到配置的静态 token
+        effective_token = _read_dynamic_daemon_token(self.base_url) or daemon_token
+        if effective_token != daemon_token:
+            log.info("检测到 daemon 动态 token 文件，优先使用其随机 token 鉴权")
         self._headers = {
-            "Authorization": f"Bearer {daemon_token}",
+            "Authorization": f"Bearer {effective_token}",
             "X-AtomCode-Client": "webui",
         }
         # read/write/pool 不设上限：长任务（模型长时间思考、agent 执行工具）
@@ -100,6 +128,20 @@ class AtomCodeDaemon:
         self._providers_cache: set[str] = set()
         self._providers_cached_at: float = 0.0
 
+    async def _refresh_auth_token(self) -> bool:
+        """收到 401 时重读 daemon token 文件刷新鉴权头；成功返回 True。
+
+        daemon 被看门狗/用户重启后会生成新随机 token，客户端缓存的旧 token
+        失效。token 文件未变化或不可读时返回 False，让 401 按原语义上抛。
+        """
+        token = _read_dynamic_daemon_token(self.base_url)
+        new_header = f"Bearer {token}" if token else None
+        if not new_header or self._client.headers.get("Authorization") == new_header:
+            return False
+        self._client.headers["Authorization"] = new_header
+        log.info("daemon 鉴权 401，已从 token 文件刷新为动态 token")
+        return True
+
     async def close(self) -> None:
         states = list(self._states.values())
         await asyncio.gather(
@@ -111,6 +153,8 @@ class AtomCodeDaemon:
     async def _create_session(self, working_dir: str) -> str:
         try:
             resp = await self._client.post("/sessions", json={"working_dir": working_dir})
+            if resp.status_code == 401 and await self._refresh_auth_token():
+                resp = await self._client.post("/sessions", json={"working_dir": working_dir})
         except httpx.HTTPError as exc:
             raise _wrap_httpx_errors(exc) from exc
         if resp.status_code < 200 or resp.status_code >= 300:
@@ -136,6 +180,11 @@ class AtomCodeDaemon:
                 f"/sessions/{session_id}/messages",
                 json={"messages": messages},
             )
+            if resp.status_code == 401 and await self._refresh_auth_token():
+                resp = await self._client.post(
+                    f"/sessions/{session_id}/messages",
+                    json={"messages": messages},
+                )
         except httpx.HTTPError as exc:
             raise _wrap_httpx_errors(exc) from exc
         if resp.status_code < 200 or resp.status_code >= 300:
@@ -151,6 +200,12 @@ class AtomCodeDaemon:
                 self._client.post("/chat/stop", json={"session_id": session_id}),
                 timeout=5.0,
             )
+            if resp.status_code == 401:
+                if await self._refresh_auth_token():
+                    resp = await asyncio.wait_for(
+                        self._client.post("/chat/stop", json={"session_id": session_id}),
+                        timeout=5.0,
+                    )
         except Exception as exc:
             log.warning("stop daemon chat failed for session %s: %s", session_id, exc)
             return
@@ -214,6 +269,8 @@ class AtomCodeDaemon:
     async def list_models(self) -> list[dict[str, Any]]:
         try:
             resp = await self._client.get("/models")
+            if resp.status_code == 401 and await self._refresh_auth_token():
+                resp = await self._client.get("/models")
         except httpx.HTTPError as exc:
             raise _wrap_httpx_errors(exc) from exc
         if resp.status_code != 200:
@@ -381,22 +438,26 @@ class AtomCodeDaemon:
             "approval_mode": approval_mode or self.approval_mode,
         }
         log.info("daemon chat start session=%s request=%s working_dir=%s", session_id, request_id, working_dir)
-        async with self._client.stream("POST", "/chat", json=body) as resp:
-            if resp.status_code == 409:
-                raise SessionBusyError(session_id)
-            if resp.status_code != 200:
-                text = (await resp.aread()).decode("utf-8", "replace")
-                raise AtomCodeDaemonError(f"chat failed: {resp.status_code} {text[:300]}", resp.status_code)
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    # 忽略注释行（: bye）与空行
+        for attempt in range(2):
+            async with self._client.stream("POST", "/chat", json=body) as resp:
+                if resp.status_code == 409:
+                    raise SessionBusyError(session_id)
+                if resp.status_code == 401 and attempt == 0 and await self._refresh_auth_token():
+                    # daemon 重启后随机 token 已换：刷新鉴权头后重试一次
                     continue
-                payload = line[len("data:"):].strip()
-                if not payload:
-                    continue
-                try:
-                    yield json.loads(payload)
-                except json.JSONDecodeError:
-                    log.warning("skip non-json sse payload: %r", payload[:200])
+                if resp.status_code != 200:
+                    text = (await resp.aread()).decode("utf-8", "replace")
+                    raise AtomCodeDaemonError(f"chat failed: {resp.status_code} {text[:300]}", resp.status_code)
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        # 忽略注释行（: bye）与空行
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if not payload:
+                        continue
+                    try:
+                        yield json.loads(payload)
+                    except json.JSONDecodeError:
+                        log.warning("skip non-json sse payload: %r", payload[:200])
         log.info("daemon chat stream ended session=%s request=%s", session_id, request_id)
