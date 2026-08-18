@@ -7,6 +7,14 @@
 把 OpenAI / Anthropic 兼容协议翻译为 AtomCode 本地 daemon 协议的适配代理，
 使 Codex CLI、Cursor 等工具可以直接使用 AtomCode 的云端模型。
 
+## 模型权益说明（重要，先读这里）
+
+可用模型列表**不是固定的**：它由 AtomCode 本地 daemon 按当前登录的 AtomGit 账号所持有的 [CodingPlan](https://ai.atomgit.com/serverless-api) 套餐权益动态下发，代理只是实时转发（`/v1/models`、`/api/models` 均直接取自 daemon，无任何内置名单）。
+
+- **免费档**默认包含 `AtomGit-deepseek-v4-flash`（默认模型）与 `AtomGit-Qwen-Qwen3-VL-8B-Instruct`。官方上新套餐（如 `AtomGit-LongCat-2.0` 等）后，**需要账号领取对应套餐**，对应模型才会出现在列表中——列表里没有某个模型时，请先确认账号已领取该模型所属套餐。
+- **获取更多模型**：在 AtomCode 终端执行 `/login` 登录 AtomGit 账号（OAuth 授权并自动申领 CodingPlan 免费额度），再执行 `/codingplan` 查看/领取可用套餐（部分档位每日 10 点限量开抢）。领取后重启 AtomCode（或重新 `/login`）让权益同步，代理无需任何改动，模型列表自动更新。
+- **版本兼容提示**：atomcode 5.0.6 起 daemon 改用随机 token 鉴权，代理 v0.1.20 起已适配；更早版本的代理对 5.0.6+ daemon 会返回 401，请升级到最新 Release。
+
 ## 架构
 
 ```mermaid
@@ -130,7 +138,7 @@ python run.py
 - **Base URL（OpenAI 兼容）**：`http://127.0.0.1:8765/v1`
 - **Base URL（Anthropic 兼容）**：`http://127.0.0.1:8765`
 - **API Key**：任意非空值即可（代理不校验）
-- **可用模型**：`AtomGit-deepseek-v4-flash`（默认）、`AtomGit-Qwen-Qwen3-VL-8B-Instruct`
+- **可用模型**：由账号 CodingPlan 权益动态决定（见顶部「模型权益说明」）；免费档默认含 `AtomGit-deepseek-v4-flash`（默认）、`AtomGit-Qwen-Qwen3-VL-8B-Instruct`，领取更多套餐后自动扩充
 
 ### Codex CLI（OpenAI 兼容）
 
@@ -180,6 +188,8 @@ claude
    配置效果见下图：
 
    ![dsh Web UI 自定义模型配置](assets/dsh-webui-config.png)
+
+> 💡 经过作者测试，deepseek 模型在 dsh 中表现确实比其他客户端更好，推荐优先使用 dsh 接入。
 
 ### Cline / Roo Code（VS Code 插件，OpenAI 兼容）
 
