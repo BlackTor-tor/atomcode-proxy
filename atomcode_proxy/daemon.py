@@ -366,6 +366,10 @@ class AtomCodeDaemon:
                             yield ev
                         if not terminal_seen:
                             await self._stop_chat_shielded(session_id)
+                            raise AtomCodeDaemonError(
+                                "daemon stream ended before terminal event",
+                                502,
+                            )
                         return
                     except SessionBusyError:
                         if retried:

@@ -4,6 +4,7 @@ import httpx
 
 from atomcode_proxy.app import create_app
 from atomcode_proxy.config import Config
+from atomcode_proxy.daemon import AtomCodeDaemon
 
 
 class FakeDaemon:
@@ -26,6 +27,26 @@ class ErrorDaemon(FakeDaemon):
     async def chat_with_session(self, message, **kwargs):
         self.calls.append((message, kwargs))
         yield {"type": "error", "message": "Provider 'x' not found"}
+
+
+class PrematureEofDaemon(AtomCodeDaemon):
+    """输出部分文本后提前 EOF，用于验证异常流不会伪装成 completed。"""
+
+    def __init__(self):
+        super().__init__()
+        self.stopped_sessions = []
+
+    async def resolve_provider(self, model, aliases=None, default_provider=None):
+        return model or default_provider or "test-provider"
+
+    async def _create_session(self, working_dir):
+        return "session-premature-eof"
+
+    async def _chat_stream_raw(self, *args, **kwargs):
+        yield {"type": "text", "content": "partial"}
+
+    async def stop_chat(self, session_id):
+        self.stopped_sessions.append(session_id)
 
 
 def test_openai_adapter_passes_request_directory_and_history(tmp_path):
@@ -211,6 +232,34 @@ def test_responses_endpoint_stream_emits_codex_event_sequence(tmp_path):
         assert "event: response.output_text.done" in body
         assert "event: response.completed" in body
         assert '"status": "completed"' in body
+
+    asyncio.run(run())
+
+
+def test_responses_stream_reports_premature_eof_as_failed(tmp_path):
+    """daemon 提前 EOF 时 Responses 流必须失败，不能把部分文本标记为完成。"""
+
+    async def run():
+        app = create_app(Config(working_dir=str(tmp_path)))
+        daemon = PrematureEofDaemon()
+        app.state.daemon = daemon
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post(
+                    "/v1/responses",
+                    json={"model": "x", "input": "hello", "stream": True},
+                )
+        finally:
+            await daemon._client.aclose()
+
+        body = response.text
+        assert response.status_code == 200
+        assert '"delta": "partial"' in body
+        assert "event: response.failed" in body
+        assert "ended before terminal event" in body
+        assert "event: response.completed" not in body
+        assert daemon.stopped_sessions == ["session-premature-eof"]
 
     asyncio.run(run())
 

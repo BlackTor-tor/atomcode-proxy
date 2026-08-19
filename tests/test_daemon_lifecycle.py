@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 import atomcode_proxy.daemon as daemon_module
-from atomcode_proxy.daemon import AtomCodeDaemon, SessionBusyError
+from atomcode_proxy.daemon import AtomCodeDaemon, AtomCodeDaemonError, SessionBusyError
 
 
 class FakeResponse:
@@ -167,6 +167,39 @@ def test_cancelled_chat_stops_daemon_before_releasing_session():
         else:
             raise AssertionError("chat task was expected to be cancelled")
 
+        assert ("/chat/stop", {"json": {"session_id": "session-1"}}) in client.posts
+
+    asyncio.run(run())
+
+
+def test_chat_stream_without_terminal_event_raises_and_stops_session():
+    """daemon SSE 提前 EOF 时必须报错，不能把半截回复当作正常结束。"""
+
+    async def run():
+        daemon = AtomCodeDaemon()
+        client = FakeClient()
+        daemon._client = client
+
+        async def truncated_stream(*args, **kwargs):
+            yield {"type": "text", "content": "partial"}
+
+        daemon._chat_stream_raw = truncated_stream
+
+        events = []
+        try:
+            async for event in daemon.chat_with_session(
+                "hello",
+                working_dir="F:/workspace",
+                conversation_key="conversation-1",
+            ):
+                events.append(event)
+        except AtomCodeDaemonError as exc:
+            assert "ended before terminal event" in str(exc)
+            assert exc.status_code == 502
+        else:
+            raise AssertionError("提前 EOF 必须抛出 AtomCodeDaemonError")
+
+        assert events == [{"type": "text", "content": "partial"}]
         assert ("/chat/stop", {"json": {"session_id": "session-1"}}) in client.posts
 
     asyncio.run(run())
